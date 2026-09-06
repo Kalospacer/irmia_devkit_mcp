@@ -6,6 +6,7 @@ _file_utils — 文件读取共享代码。
 import difflib
 import hashlib
 import os
+import re
 from pathlib import Path
 
 
@@ -31,6 +32,36 @@ _TEXT_EXTENSIONS = frozenset({
     ".sql", ".vim", ".emacs", ".el", ".lisp", ".scm", ".rkt",
     ".nim", ".nims", ".nimble", ".svg",
 })
+
+
+# safe_read 行号前缀（f"{n:>6}│ {line}"）——LLM 连前缀一起复制给编辑工具时的防呆。
+# 同时兼容 syntax_check/lint_runner 错误上下文的 "→  87│ code" 格式（可带 → 标记）。
+_LINE_NUM_PREFIX_RE = re.compile(r"^[\s→]{0,8}\d{1,6}│ ?")
+
+
+def strip_line_number_prefixes(text: str) -> tuple[str, bool]:
+    """若文本所有非空行都带 safe_read 行号前缀（'  123│ ...'），剥除前缀。
+
+    仅在**所有**非空行都匹配时剥除（避免破坏部分含 '│' 的正常文本）。
+    调用方必须先尝试精确匹配，失败后才用本函数兜底——文件中字面包含
+    '数字│' 的内容仍能走精确匹配路径。
+
+    Returns:
+        (stripped_text, changed)
+    """
+    if "│" not in text:
+        return text, False
+    lines = text.split("\n")
+    content_lines = [l for l in lines if l.strip()]
+    if not content_lines:
+        return text, False
+    if not all(_LINE_NUM_PREFIX_RE.match(l) for l in content_lines):
+        return text, False
+    stripped = [
+        _LINE_NUM_PREFIX_RE.sub("", l, count=1) if l.strip() else l
+        for l in lines
+    ]
+    return "\n".join(stripped), True
 
 
 # 文本编码探测相关常量
@@ -160,11 +191,6 @@ def detect_encoding(path: str | Path, sample_size: int = _PROBE_BYTES) -> str:
     return "latin-1"
 
 
-def _detect_encoding(path: str | Path) -> str:
-    """兼容旧内部名。"""
-    return detect_encoding(path)
-
-
 def is_binary_file(path: str | Path, sample_size: int = 8192) -> tuple[bool, str]:
     """检测文件是否为二进制文件，返回 (is_binary, reason)。"""
     p = Path(path)
@@ -205,16 +231,18 @@ def _check_path_safety(path: str | Path, *, read: bool = True) -> dict | None:
         return {"ok": False, "error": "路径包含 .. 穿越，已被拒绝"}
 
     p = Path(path).resolve()
-    from .file_remove import _forbidden_prefix
+    path_str = str(p).replace("\\", "/")
+    from .file_remove import _FORBIDDEN_PREFIXES
 
-    forbidden = _forbidden_prefix(p)
-    if forbidden:
-        return {
-            "ok": False,
-            "error": f"禁止访问系统目录: {p}",
-            "proposal": "路径位于受保护的系统目录中，读取操作已被拦截。",
-            "evidence": {"path": str(p), "blocked_by": forbidden},
-        }
+    for forbidden in _FORBIDDEN_PREFIXES:
+        forbidden_norm = forbidden.replace("\\", "/")
+        if path_str.lower().startswith(forbidden_norm.lower() + "/") or path_str.lower() == forbidden_norm.lower():
+            return {
+                "ok": False,
+                "error": f"禁止访问系统目录: {p}",
+                "proposal": "路径位于受保护的系统目录中，读取操作已被拦截。",
+                "evidence": {"path": str(p), "blocked_by": forbidden},
+            }
     return None
 
 
@@ -257,10 +285,21 @@ def human_size(n: int) -> str:
     return s.replace(".0PB", "PB")
 
 
+def _atomic_target_mode(path: str | Path) -> int | None:
+    """返回原子替换后的 POSIX 权限位；非 POSIX 平台不做 mode 处理。"""
+    if os.name != "posix":
+        return None
+    try:
+        return Path(path).stat().st_mode & 0o777
+    except FileNotFoundError:
+        return 0o644
+
+
 def atomic_write_text(path: str | Path, content: str, encoding: str = "utf-8") -> None:
     """原子写入文本文件：先写同目录临时文件，再 os.replace 替换目标文件。
 
     保留原始换行符（调用方需确保 content 中的换行符已是期望形式）。
+    POSIX 下保留现有文件权限位；新文件默认 0644。
     """
     import os as _os
     import tempfile as _tmp
@@ -271,6 +310,9 @@ def atomic_write_text(path: str | Path, content: str, encoding: str = "utf-8") -
     try:
         with _os.fdopen(fd, "w", encoding=encoding, newline="") as f:
             f.write(content)
+        final_mode = _atomic_target_mode(target)
+        if final_mode is not None:
+            _os.chmod(tmp, final_mode)
         _os.replace(str(tmp), str(target))
     except Exception:
         try:
@@ -296,6 +338,64 @@ def backup_name_stem(p: Path) -> str:
     parent_str = str(p.parent.resolve()).replace("\\", "/")
     dir_hash = hashlib.sha256(parent_str.encode("utf-8")).hexdigest()[:8]
     return f"{p.name}.{dir_hash}"
+
+
+# 备份文件名规则：{backup_name_stem}.{时间戳}[.{种类}].bak
+#   时间戳为 %Y%m%d_%H%M%S_%f（safe_edit/safe_write/multi_edit）
+#   或 %Y%m%d%H%M%S（rollback 的 prerollback 快照）
+_BACKUP_NAME_RE = re.compile(
+    r"^(?P<stem>.+\.[0-9a-f]{8})\.(?:\d{8}_\d{6}_\d{6}|\d{14})(?:\.[a-z]+)?\.bak$"
+)
+
+
+def prune_backups(backup_dir: str, keep_per_file: int = 10, max_total_mb: int = 500) -> None:
+    """清理备份目录：每个源文件保留最近 keep_per_file 份，再按总大小 LRU 淘汰最旧的。
+
+    按备份文件名主干（源文件名+目录哈希）分组，组内按 mtime 保留最新若干份；
+    随后统计幸存备份总大小，超过 max_total_mb 时从最旧开始删除直到达标。
+    用 os.scandir 单次扫描（Windows 上缓存 stat 数据），避免每次编辑付出显著开销。
+    防御性设计：任何异常静默吞掉——备份清理绝不能弄挂编辑主流程。
+    """
+    try:
+        if not os.path.isdir(backup_dir):
+            return
+        # (path, mtime, size) 三元组，stat 数据来自 scandir 缓存
+        groups: dict[str, list[tuple[str, float, int]]] = {}
+        with os.scandir(backup_dir) as it:
+            for entry in it:
+                try:
+                    if not entry.name.endswith(".bak") or not entry.is_file():
+                        continue
+                    st = entry.stat()
+                except OSError:
+                    continue
+                m = _BACKUP_NAME_RE.match(entry.name)
+                key = m.group("stem") if m else entry.name
+                groups.setdefault(key, []).append((entry.path, st.st_mtime, st.st_size))
+        keep = max(keep_per_file, 0)
+        survivors: list[tuple[str, float, int]] = []
+        for files in groups.values():
+            files.sort(key=lambda t: t[1], reverse=True)
+            survivors.extend(files[:keep])
+            for path, _, _ in files[keep:]:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        # 全局 LRU：总大小超限，从最旧开始淘汰
+        max_bytes = max_total_mb * 1024 * 1024
+        survivors.sort(key=lambda t: t[1])
+        total = sum(t[2] for t in survivors)
+        for path, _, size in survivors:
+            if total <= max_bytes:
+                break
+            try:
+                os.unlink(path)
+                total -= size
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 
 def find_closest_line(content: str, old: str, threshold: float = 0.5) -> dict | None:

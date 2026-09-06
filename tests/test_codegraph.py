@@ -334,7 +334,7 @@ class TestCodeGraphTopSource:
             assert sym["total_lines"] == 122
             returned_lines = len(sym["source"].splitlines())
             assert returned_lines <= 65  # head 40 + tail 20 + 2 marker + 1
-            assert sym.get("next_call") == {"tool": "code_pack", "args": {"target": "big"}}
+            assert sym.get("next_call") == {"tool": "code_pack", "params": {"target": "big"}}
             assert "code_pack('big')" in sym.get("options", [])
             assert "code_pack" in sym.get("footer", "")
         finally:
@@ -521,5 +521,168 @@ class TestBfsPath:
         try:
             path = _bfs_path(conn, "helper", "nonexistent", max_depth=3)
             assert path is None
+        finally:
+            cg.close()
+
+
+class TestEnsureDbSkip:
+    """_ensure_db 幂等跳过：同一 db_path 二次初始化跳过 DDL，仅做每连接 PRAGMA。"""
+
+    def test_second_init_skips_ddl(self, tmp_path):
+        from tools import codegraph
+
+        db = str(tmp_path / "skip.db")
+        key = os.path.abspath(db)
+        codegraph._ENSURED.discard(key)
+        # 通过 __dict__ 取底层函数，恢复时重新包 staticmethod，避免变成实例方法
+        original = CodeGraph.__dict__["_create_schema"].__func__
+        calls = []
+
+        def spy(conn):
+            calls.append(1)
+            return original(conn)
+
+        try:
+            cg1 = CodeGraph(db)
+            cg1.close()
+            assert key in codegraph._ENSURED
+            assert len(calls) == 0  # spy 尚未挂载
+
+            CodeGraph._create_schema = staticmethod(spy)
+            try:
+                cg2 = CodeGraph(db)
+            finally:
+                CodeGraph._create_schema = staticmethod(original)
+            assert calls == []  # 二次初始化未触发 DDL
+            try:
+                # 连接可用，表结构仍在
+                conn = cg2._conn_get()
+                conn.execute("INSERT INTO meta(key,value) VALUES('k','v')")
+                conn.commit()
+                assert conn.execute("SELECT value FROM meta WHERE key='k'").fetchone()[0] == "v"
+            finally:
+                cg2.close()
+        finally:
+            codegraph._ENSURED.discard(key)
+
+
+class TestRelatedLocations:
+    """R3：引用位置字段（纯增量，旧字段不变）。"""
+
+    def test_related_symbols_include_locations(self, test_db):
+        cg = CodeGraph(test_db)
+        try:
+            r = cg.explore("helper 在哪")
+            assert r["found"] is True
+            related = r["related_symbols"]
+            # 旧字段保持
+            assert "main" in related["callers"]
+            # 新增位置字段
+            assert "caller_locations" in related
+            assert "callee_locations" in related
+            locs = related["caller_locations"]
+            assert len(locs) <= 50
+            main_locs = [l for l in locs if l["name"] == "main"]
+            assert main_locs
+            assert main_locs[0]["file"]
+            assert isinstance(main_locs[0]["line"], int)
+        finally:
+            cg.close()
+
+    def test_trace_open_include_locations(self, test_db):
+        cg = CodeGraph(test_db)
+        try:
+            r = cg.explore("helper 调用链")
+            assert r["found"] is True
+            assert "caller_locations" in r
+            assert "callee_locations" in r
+            assert isinstance(r["caller_locations"], list)
+            # 旧字段保持
+            assert "callers" in r and "callees" in r
+        finally:
+            cg.close()
+
+
+class TestFtsIncrementalConsistency:
+    """回归测试：FTS 与 symbols 的一致性维护。
+
+    修复前：增量 INSERT 被 `except: pass` 吞掉，FTS 一旦脱节便永久漏搜。
+    修复后：收尾处在需要时全量重建 FTS（DELETE + 从 symbols 重灌），
+    保证 FTS 始终能回到与 symbols 一致的状态。
+    """
+
+    def test_fts_rebuild_restores_consistency(self, tmp_project):
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        cg = CodeGraph(db_path)
+        try:
+            cg.index(tmp_project)  # 全量建索引
+            conn = cg._conn_get()
+
+            # 人为制造不一致：从 FTS 删掉一个 symbols 里存在的符号
+            conn.execute("DELETE FROM sym_fts WHERE name='helper'")
+            conn.commit()
+            n = conn.execute("SELECT COUNT(*) FROM sym_fts WHERE name='helper'").fetchone()[0]
+            assert n == 0, "前置条件：FTS 中应已无 helper"
+
+            # 触发一次非增量索引（等价于收尾重建路径），FTS 应被重灌恢复一致
+            cg.index(tmp_project, incremental=False)
+            n = conn.execute("SELECT COUNT(*) FROM sym_fts WHERE name='helper'").fetchone()[0]
+            assert n >= 1, "FTS 重建后应恢复 helper，与 symbols 一致"
+        finally:
+            cg.close()
+            for f in [db_path, db_path + "-shm", db_path + "-wal"]:
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
+
+
+class TestIndexStaleness:
+    """索引过期探测：索引后被修改的文件应触发 index_stale 警告（行号可能漂移）。"""
+
+    def _cg_in_project(self, tmp_project):
+        db_dir = Path(tmp_project) / ".codegraph"
+        db_dir.mkdir(exist_ok=True)
+        cg = CodeGraph(str(db_dir / "codegraph.db"))
+        cg.index(tmp_project)
+        return cg
+
+    def test_explore_flags_stale_file(self, tmp_project):
+        cg = self._cg_in_project(tmp_project)
+        try:
+            # 索引后修改文件（mtime 拨到未来）
+            target = Path(tmp_project) / "utils.py"
+            future = cg._conn_get().execute(
+                "SELECT CAST(value AS REAL) FROM meta WHERE key='last_index'").fetchone()[0] + 100
+            os.utime(target, (future, future))
+
+            r = cg.explore("helper")
+            assert r["ok"] is True
+            assert r.get("index_stale") is True
+            assert "stale_warning" in r
+        finally:
+            cg.close()
+
+    def test_explore_fresh_index_no_flag(self, tmp_project):
+        cg = self._cg_in_project(tmp_project)
+        try:
+            r = cg.explore("helper")
+            assert r["ok"] is True
+            assert "index_stale" not in r
+        finally:
+            cg.close()
+
+    def test_code_pack_flags_stale_file(self, tmp_project):
+        cg = self._cg_in_project(tmp_project)
+        try:
+            target = Path(tmp_project) / "utils.py"
+            future = cg._conn_get().execute(
+                "SELECT CAST(value AS REAL) FROM meta WHERE key='last_index'").fetchone()[0] + 100
+            os.utime(target, (future, future))
+
+            r = cg.code_pack("helper")
+            assert r["ok"] is True
+            assert r.get("index_stale") is True
         finally:
             cg.close()

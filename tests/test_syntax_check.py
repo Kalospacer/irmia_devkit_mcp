@@ -9,11 +9,9 @@ import pytest
 from tools.syntax_check import check
 
 
-def _write_temp(suffix, content, encoding=None):
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    mode = "w" if encoding else "w"
-    kw = {"encoding": encoding} if encoding else {}
-    with os.fdopen(fd, mode, **kw) as f:
+def _write_temp(suffix, content):
+    fd, path = tempfile.mkstemp(suffix=suffix, text=True)
+    with os.fdopen(fd, "w") as f:
         f.write(content)
     return path
 
@@ -80,7 +78,7 @@ class TestSyntaxCheckPython:
 
     def test_gbk_fallback(self):
         """UTF-8 失败时回退 GBK"""
-        path = _write_temp(".py", "x = '中文'\n", encoding="gbk")
+        path = _write_temp(".py", "x = '中文'\n")
         try:
             result = check(path)
             assert result["ok"] is True
@@ -95,7 +93,7 @@ class TestSyntaxCheckOther:
         try:
             result = check(path)
             # go 可能未安装 → skipped:true 或 ok:true
-            assert result["ok"] is True or result.get("skipped") is True
+            assert result["ok"] is True
         finally:
             os.unlink(path)
 
@@ -113,7 +111,6 @@ class TestSyntaxCheckOther:
         path = _write_temp(".js", "console.log('hi');\n")
         try:
             result = check(path)
-            # node 可能未安装 → skipped:true 或 ok:true
-            assert result["ok"] is True or result.get("skipped") is True
+            assert result["ok"] is True
         finally:
             os.unlink(path)

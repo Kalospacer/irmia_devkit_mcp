@@ -6,100 +6,28 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+from .shell_exec import split_command, validate_command
+
+
+def _resolve_exe(args: list[str]) -> list[str]:
+    """Windows 上 npx/npm 是 .cmd 脚本，shell=False 按名调用会 FileNotFoundError；
+    用 shutil.which 解析全路径。解析失败保留原命令名，交由 _run 的
+    FileNotFoundError 降级逻辑处理。"""
+    if not args:
+        return args
+    resolved = shutil.which(args[0])
+    if resolved:
+        return [resolved] + args[1:]
+    return args
 
 
 
-
-
-
-
-_DANGEROUS_RAW = ("|", ";", "&", "||", ">", "<", "$(", "`", "\n", "\r", "%")
-_SAFE_COMMANDS: dict[str, tuple[str, ...]] = {
-    "npm": ("test", "run", "build", "lint", "install"),
-    "npx": ("jest", "vitest", "tsc", "eslint"),
-    "cargo": ("test", "build", "check", "clippy", "fmt"),
-    "go": ("test", "build", "vet", "fmt"),
-    "pip": ("install", "uninstall", "list", "freeze"),
-    "make": ("*",),
-    "pytest": ("*",),
-    "python": ("-m",),
-    "py": ("-m",),
-}
-_HIGH_RISK = {
-    ("pip", "install"),
-    ("pip", "uninstall"),
-    ("npm", "install"),
-    ("make", "*"),
-}
-
-
-def _split_command(cmd: str) -> list[str]:
-    """Split a command string without invoking a shell."""
-    import os
-    import shlex
-
-    if not cmd or not cmd.strip():
-        raise ValueError("cmd must not be empty")
-    if any(part in cmd for part in _DANGEROUS_RAW):
-        raise ValueError("command contains shell control characters")
-    try:
-        parts = shlex.split(cmd, posix=(os.name != "nt"))
-    except ValueError as exc:
-        raise ValueError(f"invalid command syntax: {exc}") from exc
-    cleaned = [p for p in parts if p.strip()]
-    if not cleaned:
-        raise ValueError("cmd must not be empty")
-    if any(sep in cleaned[0] for sep in ("/", "\\")):
-        raise ValueError("command must be a bare executable name (no path separators)")
-    for arg in cleaned:
-        if any(part in arg for part in _DANGEROUS_RAW):
-            raise ValueError("argument contains shell control characters")
-        lowered = arg.replace("\\", "/").lower()
-        if lowered.startswith("/dev/") or "/dev/" in lowered:
-            raise ValueError("argument references /dev, which is not allowed")
-    return cleaned
-
-
-def _subcommand(args: list[str]) -> str:
-    if len(args) < 2:
-        return ""
-    return args[1].lower()
-
-
-def _validate_command(args: list[str], allow_high_risk: bool = False) -> dict:
-    exe = Path(args[0]).name.lower()
-    if exe.endswith(".exe"):
-        exe = exe[:-4]
-    allowed = _SAFE_COMMANDS.get(exe)
-    if allowed is None:
-        return {"ok": False, "error": f"command not allowed: {args[0]}"}
-
-    sub = _subcommand(args)
-    if exe in ("python", "py"):
-        if len(args) < 3 or args[1] != "-m" or args[2] != "pytest":
-            return {"ok": False, "error": "only python -m pytest is allowed"}
-        sub = "-m"
-    elif "*" not in allowed and sub not in allowed:
-        return {"ok": False, "error": f"subcommand not allowed: {exe} {sub or '<none>'}"}
-
-    risk_key = (exe, sub)
-    if exe == "make":
-        risk_key = ("make", "*")
-    high_risk = risk_key in _HIGH_RISK
-    if high_risk and not allow_high_risk:
-        return {
-            "ok": False,
-            "error": f"high-risk command requires allow_high_risk=true: {' '.join(args)}",
-            "proposal": "Review the command first, then retry with allow_high_risk=true if it is intentional.",
-            "evidence": {"command": args, "risk": "high"},
-            "options": ["dry_run=true", "allow_high_risk=true", "cancel"],
-        }
-    return {"ok": True, "command": args, "high_risk": high_risk}
 
 
 def _resolve_project_dir(filepath: str = "", project_dir: str = ".") -> Path:
@@ -123,12 +51,12 @@ def discover(project_dir: Path) -> tuple[str, list[str]]:
             deps.update(data.get("dependencies", {}) if isinstance(data, dict) else {})
             deps.update(data.get("devDependencies", {}) if isinstance(data, dict) else {})
             if "jest" in deps or "jest" in str(scripts.get("test", "")):
-                return "jest", ["npx", "jest", "--json"]
+                return "jest", _resolve_exe(["npx", "jest", "--json"])
             if "test" in scripts:
-                return "npm", ["npm", "test"]
+                return "npm", _resolve_exe(["npm", "test"])
         except Exception:
             pass
-        return "jest", ["npx", "jest", "--json"]
+        return "jest", _resolve_exe(["npx", "jest", "--json"])
     return "pytest", [sys.executable, "-m", "pytest", "-q", "--tb=short"]
 
 
@@ -142,7 +70,7 @@ def _run(args: list[str], cwd: Path, timeout: int) -> tuple[int, str, str, float
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=max(1, int(timeout)),
+            timeout=min(max(1, int(timeout)), 600),
             shell=False,
         )
         return proc.returncode, proc.stdout or "", proc.stderr or "", time.monotonic() - start, False
@@ -332,35 +260,6 @@ def _parser_for(framework: str):
     return _parse_pytest
 
 
-
-
-def _validate_path_args(args: list[str], cwd: Path) -> dict | None:
-    """Validate all path-like arguments stay inside the project directory."""
-    for arg in args[1:]:
-        if not arg or arg.startswith('-'):
-            continue
-        lowered = arg.replace('', '/').lower()
-        if not ('/' in lowered or '..' in lowered or arg.startswith('~') or (len(arg) >= 2 and arg[1] == ':')):
-            continue
-        if arg.startswith('~'):
-            return {'ok': False, 'error': '参数包含 ~ 展开: ' + arg}
-        pa = Path(arg)
-        if pa.is_absolute():
-            try:
-                pa.resolve().relative_to(cwd.resolve())
-            except ValueError:
-                return {'ok': False, 'error': '参数指向项目外路径: ' + arg}
-            return None
-        try:
-            resolved = (cwd / arg).resolve()
-            resolved.relative_to(cwd.resolve())
-        except ValueError:
-            return {'ok': False, 'error': '参数逃逸项目目录: ' + arg}
-        except OSError:
-            return {'ok': False, 'error': '参数路径非法: ' + arg}
-    return None
-
-
 def run(
     filepath: str = "",
     project_dir: str = ".",
@@ -374,22 +273,14 @@ def run(
     framework, args = discover(root)
     if test_cmd:
         try:
-            args = _split_command(test_cmd)
+            args = split_command(test_cmd)
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
-        valid = _validate_command(args, allow_high_risk=False)
+        valid = validate_command(args, allow_high_risk=False)
         if not valid.get("ok"):
             return valid
-        path_check = _validate_path_args(args, root)
-        if path_check:
-            return path_check
         exe = Path(args[0]).name.lower().removesuffix(".exe")
         framework = {"python": "pytest", "py": "pytest", "pytest": "pytest", "go": "go", "cargo": "cargo", "npx": "jest", "npm": "npm"}.get(exe, framework)
-    elif filepath:
-        # 传入 filepath 但没有自定义 test_cmd：追加到自动检测的命令行
-        fp = str(Path(filepath).resolve())
-        if framework in ("pytest", "jest"):
-            args.append(fp)
 
     returncode, stdout, stderr, elapsed, timed_out = _run(args, root, timeout)
     result = _parser_for(framework)(stdout, stderr, returncode, elapsed, timed_out)

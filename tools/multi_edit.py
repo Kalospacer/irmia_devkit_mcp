@@ -10,12 +10,22 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from ._file_utils import SAFE_EDIT_MAX_SIZE, read_file_with_encoding, find_closest_line, align_whitespace, backup_name_stem, check_path_allowed
+from ._file_utils import SAFE_EDIT_MAX_SIZE, read_file_with_encoding, find_closest_line, align_whitespace, backup_name_stem, check_path_allowed, prune_backups, strip_line_number_prefixes
+from ._file_utils import _atomic_target_mode
 from .safe_edit import _backup_dir
 from .syntax_check import check as syntax_check_file
 
 
 _CODE_SUFFIXES = (".py", ".nim", ".go", ".js", ".ts", ".jsx", ".tsx")
+
+
+class AmbiguousMatchError(ValueError):
+    """old 文本多匹配且未指定 occurrence/replace_all 时抛出，携带匹配位置证据。"""
+
+    def __init__(self, message: str, matches: list | None = None, total: int = 0):
+        super().__init__(message)
+        self.matches = matches or []
+        self.total = total
 
 
 def _normalize_line_endings(s: str) -> str:
@@ -54,6 +64,15 @@ def _apply_one(content: str, edit_item: dict, item_index: int) -> tuple[str, dic
         raise ValueError(f"edit #{item_index}: replace_all and occurrence are mutually exclusive")
     positions = _positions(content, old)
     if not positions:
+        # 防呆：LLM 把 safe_read 行号前缀（'  123│ ...'）连内容复制给 old 时剥除重试
+        stripped_old, had_prefix = strip_line_number_prefixes(old)
+        if had_prefix:
+            stripped_new, _ = strip_line_number_prefixes(new)
+            p2 = _positions(content, stripped_old)
+            if p2:
+                old, new = stripped_old, stripped_new
+                positions = p2
+    if not positions:
         # P0-1: whitespace-tolerant fallback (inherited from safe_edit)
         aligned = align_whitespace(content, old, new)
         if aligned:
@@ -85,7 +104,11 @@ def _apply_one(content: str, edit_item: dict, item_index: int) -> tuple[str, dic
             if line_end == -1:
                 line_end = len(content)
             previews.append({"line": line, "col": col, "preview": content[line_start:line_end].strip()[:100]})
-        raise ValueError(f"edit #{item_index}: old text appears {len(positions)} times; specify occurrence or replace_all")
+        raise AmbiguousMatchError(
+            f"edit #{item_index}: old text appears {len(positions)} times; specify occurrence or replace_all",
+            matches=previews,
+            total=len(positions),
+        )
     idx = positions[0]
     return content[:idx] + new + content[idx + len(old):], {"replaced": 1}
 
@@ -179,10 +202,42 @@ def run(edits: list, syntax_check: bool = True) -> dict:
             files[path]["content"] = new_content
             files[path]["edits"].append({"index": i, **meta})
             plan.append({"file": str(path), "edit": i, **meta})
+    except AmbiguousMatchError as exc:
+        # B6: 消歧证据（匹配位置）随错误返回，与 safe_edit 的响应形态对齐
+        count = exc.total or len(exc.matches)
+        return {
+            "ok": False,
+            "error": str(exc),
+            "proposal": f"请使用 occurrence=N 指定目标（1~{count}），或设 replace_all=True 替换全部",
+            "options": [f"occurrence={i+1}" for i in range(min(count, 5))] + ["replace_all=True"],
+            "evidence": {"occurrence_count": count, "matches": exc.matches[:20]},
+            "matches": exc.matches[:20],
+            "occurrence_count": count,
+            "applied": [],
+            "total_requested": len(edits),
+            "total_applied": 0,
+            "rolled_back_all": True,
+        }
     except Exception as exc:
         return {
             "ok": False,
             "error": str(exc),
+            "applied": [],
+            "total_requested": len(edits),
+            "total_applied": 0,
+            "rolled_back_all": True,
+        }
+
+    # 先备份原文件（快照），再做语法检查，最后原子提交。
+    # 顺序不能颠倒：若先语法检查后备份，检查期间文件被外界改动会备份到错误内容（TOCTOU）。
+    backups: dict[Path, Path] = {}
+    try:
+        for path in files:
+            backups[path] = _backup_file(path)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"backup failed: {exc}",
             "applied": [],
             "total_requested": len(edits),
             "total_applied": 0,
@@ -203,17 +258,18 @@ def run(edits: list, syntax_check: bool = True) -> dict:
                     "rolled_back_all": True,
                 }
 
-    backups: dict[Path, Path] = {}
     tmp_paths: dict[Path, Path] = {}
     try:
         for path, data in files.items():
-            backups[path] = _backup_file(path)
             fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), text=True)
             final_content = data["content"].replace("\n", "\r\n") if data["has_crlf"] else data["content"]
             with os.fdopen(fd, "w", encoding=data["encoding"], newline="") as f:
                 f.write(final_content)
             tmp_paths[path] = Path(tmp_name)
         for path, tmp_path in tmp_paths.items():
+            final_mode = _atomic_target_mode(path)
+            if final_mode is not None:
+                os.chmod(tmp_path, final_mode)
             os.replace(str(tmp_path), str(path))
     except Exception as exc:
         rollback_errors = []
@@ -240,6 +296,9 @@ def run(edits: list, syntax_check: bool = True) -> dict:
 
     # calculate total replacements (replace_all may replace >1 instance per edit)
     replacements_made = sum(e.get("replaced", 1) for e in plan)
+
+    # P1: 惰性清理备份目录（防御性，异常静默吞掉，绝不影响编辑主流程）
+    prune_backups(str(_backup_dir()))
 
     return {
         "ok": True,

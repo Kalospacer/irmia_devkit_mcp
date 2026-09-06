@@ -3,16 +3,14 @@ http_download — 二进制文件下载。
 用 urllib 下载文件到本地，自动处理重定向、进度、覆盖确认。
 """
 
-import urllib.error
 import urllib.request
-import os
+import urllib.error
 import time
 import tempfile
 from pathlib import Path
 
 from ._http_utils import check_url, make_opener
 from ._file_utils import human_size
-from .file_remove import _check_path
 
 def _resolve_sandbox() -> Path:
     """返回下载沙箱路径，HOME 不可用时回退到插件目录或临时目录。"""
@@ -27,17 +25,13 @@ _MAX_DOWNLOAD_SIZE = 500 * 1024 * 1024  # H5: 500MB 上限
 
 
 def _resolve_path(path: str) -> Path:
-    """解析保存路径。绝对路径直接使用，相对路径相对于当前目录。
-    路径穿越（..）被拒绝。无路径时使用默认沙箱。"""
-    if not path or not path.strip():
-        sandbox = _DOWNLOAD_SANDBOX.resolve()
-        sandbox.mkdir(parents=True, exist_ok=True)
-        return sandbox / "download"
-    if ".." in path.replace("\\", "/").split("/"):
-        raise ValueError("路径包含 .. 穿越，已被拒绝")
-    if Path(path).is_absolute():
-        return Path(path).resolve()
-    return (Path.cwd() / path).resolve()
+    """C4: 将下载路径限制在沙箱内，防止路径遍历。"""
+    sandbox = _DOWNLOAD_SANDBOX.resolve()
+    safe_name = Path(path).name or "download"
+    resolved = (sandbox / safe_name).resolve()
+    if str(resolved).startswith(str(sandbox)):
+        return resolved
+    return sandbox / "download"
 
 
 def download(url: str, path: str, overwrite: bool = False, timeout: int = 60) -> dict:
@@ -56,14 +50,8 @@ def download(url: str, path: str, overwrite: bool = False, timeout: int = 60) ->
     if err:
         return err
 
-    try:
-        safe_path = _resolve_path(path)
-    except ValueError as e:
-        return {"ok": False, "error": str(e)}
-    path_err = _check_path(str(safe_path))
-    if path_err:
-        return path_err
-    safe_path.parent.mkdir(parents=True, exist_ok=True)
+    safe_path = _resolve_path(path)
+    _DOWNLOAD_SANDBOX.mkdir(parents=True, exist_ok=True)
 
     if safe_path.exists() and not overwrite:
         return {
@@ -72,9 +60,8 @@ def download(url: str, path: str, overwrite: bool = False, timeout: int = 60) ->
         }
 
     start = time.time()
-    temp_path: Path | None = None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "IrmiaDevKit/2.7.2"})
+        req = urllib.request.Request(url, headers={"User-Agent": "IrmiaDevKit/2.3"})
         with make_opener().open(req, timeout=timeout) as resp:
             size = int(resp.headers.get("Content-Length", 0))
             if size > _MAX_DOWNLOAD_SIZE:
@@ -85,14 +72,7 @@ def download(url: str, path: str, overwrite: bool = False, timeout: int = 60) ->
             content_type = resp.headers.get("Content-Type", "unknown")
 
             downloaded = 0
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                prefix=f".{safe_path.name}.",
-                suffix=".part",
-                dir=safe_path.parent,
-                delete=False,
-            ) as f:
-                temp_path = Path(f.name)
+            with open(safe_path, "wb") as f:
                 while True:
                     chunk = resp.read(8192)
                     if not chunk:
@@ -103,15 +83,12 @@ def download(url: str, path: str, overwrite: bool = False, timeout: int = 60) ->
                     downloaded += len(chunk)
                     f.write(chunk)
             if downloaded > _MAX_DOWNLOAD_SIZE:
-                temp_path.unlink(missing_ok=True)
-                temp_path = None
+                safe_path.unlink(missing_ok=True)
                 return {
                     "ok": False,
                     "error": f"实际下载大小超过上限 {_MAX_DOWNLOAD_SIZE // 1024 // 1024}MB",
                 }
 
-        os.replace(temp_path, safe_path)
-        temp_path = None
         elapsed = round(time.time() - start, 2)
         actual_size = safe_path.stat().st_size
         return {
@@ -123,11 +100,11 @@ def download(url: str, path: str, overwrite: bool = False, timeout: int = 60) ->
             "elapsed_s": elapsed,
         }
     except urllib.error.HTTPError as e:
+        safe_path.unlink(missing_ok=True)
         return {"ok": False, "error": f"HTTP {e.code}: {e.reason}", "url": url}
     except urllib.error.URLError as e:
+        safe_path.unlink(missing_ok=True)
         return {"ok": False, "error": f"连接失败: {e.reason}", "url": url}
     except Exception as e:
+        safe_path.unlink(missing_ok=True)
         return {"ok": False, "error": str(e), "url": url}
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)

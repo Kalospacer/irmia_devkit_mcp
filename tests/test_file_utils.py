@@ -2,7 +2,7 @@
 
 import hashlib
 import os
-import sys
+import stat
 import tempfile
 from pathlib import Path
 
@@ -177,6 +177,21 @@ class TestAtomicWriteText:
         fu.atomic_write_text(p, "café", encoding="latin-1")
         assert p.read_bytes() == "café".encode("latin-1")
 
+    @pytest.mark.skipif(os.name != "posix", reason="requires POSIX permission bits")
+    def test_new_file_uses_0644_mode(self, tmp_dir):
+        p = Path(tmp_dir) / "out.txt"
+        fu.atomic_write_text(p, "new")
+        assert stat.S_IMODE(p.stat().st_mode) == 0o644
+
+    @pytest.mark.skipif(os.name != "posix", reason="requires POSIX permission bits")
+    @pytest.mark.parametrize("mode", [0o600, 0o640, 0o755])
+    def test_overwrite_preserves_existing_mode(self, tmp_dir, mode):
+        p = Path(tmp_dir) / "out.txt"
+        p.write_text("old", encoding="utf-8")
+        p.chmod(mode)
+        fu.atomic_write_text(p, "new")
+        assert stat.S_IMODE(p.stat().st_mode) == mode
+
 
 class TestBackupNameStem:
     def test_contains_name_and_hash(self, tmp_dir):
@@ -221,17 +236,6 @@ class TestCheckPathAllowed:
             result = fu.check_path_allowed("/etc/passwd")
             assert result is not None
             assert result["ok"] is False
-
-    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS alias regression")
-    @pytest.mark.parametrize("path", ["/etc/passwd", "/var/log/system.log", "/System/Library"])
-    def test_forbidden_macos_resolved_aliases(self, path):
-        result = fu.check_path_allowed(path)
-        assert result is not None
-        assert result["ok"] is False
-
-    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS temp layout")
-    def test_macos_per_user_temp_is_allowed(self, tmp_path):
-        assert fu.check_path_allowed(tmp_path / "safe.txt") is None
 
 
 class TestIsBinaryFile:

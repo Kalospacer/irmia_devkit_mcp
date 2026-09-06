@@ -18,7 +18,7 @@ class TestFileReadBasic:
         
         assert result["ok"] is True
         assert result["encoding"] in ("utf-8", "ascii")  # ascii 是 utf-8 的子集
-        assert result["content"] == "hello world\nline 2\nline 3"
+        assert result["content"] == "     1│ hello world\n     2│ line 2\n     3│ line 3"
         assert result["total_lines"] == 3
         assert result["has_more"] is False
     
@@ -52,7 +52,7 @@ class TestFileReadPagination:
         assert result["start_line"] == 10
         assert result["end_line"] == 20
         assert result["returned_lines"] == 11
-        assert result["content"].startswith("line 10")
+        assert result["content"].startswith("    10│ line 10")
         assert result["content"].endswith("line 20")
     
     def test_head_mode(self, tmp_dir):
@@ -92,6 +92,109 @@ class TestFileReadPagination:
         assert result["truncated"] is True
 
 
+class TestFileReadLineNumbers:
+    """B8: 文本读取默认带行号前缀，line_numbers=False 保持旧行为。"""
+
+    def test_range_mode_line_numbers_default(self, tmp_dir):
+        f = Path(tmp_dir) / "lines.txt"
+        f.write_text("\n".join([f"line {i}" for i in range(1, 21)]), encoding="utf-8")
+
+        result = safe_read.read(str(f), start_line=5, end_line=7)
+
+        assert result["ok"] is True
+        assert result["content"] == "     5│ line 5\n     6│ line 6\n     7│ line 7"
+
+    def test_line_numbers_disabled_keeps_old_behavior(self, tmp_dir):
+        f = Path(tmp_dir) / "plain.txt"
+        f.write_text("hello world\nline 2\nline 3\n", encoding="utf-8")
+
+        result = safe_read.read(str(f), line_numbers=False)
+
+        assert result["ok"] is True
+        assert result["content"] == "hello world\nline 2\nline 3"
+
+    def test_head_mode_line_numbers(self, tmp_dir):
+        f = Path(tmp_dir) / "lines.txt"
+        f.write_text("\n".join([f"line {i}" for i in range(1, 11)]), encoding="utf-8")
+
+        result = safe_read.read(str(f), head=3)
+
+        assert result["ok"] is True
+        assert result["content"].startswith("     1│ line 1")
+        assert "     3│ line 3" in result["content"]
+
+    def test_tail_mode_line_numbers_use_real_lineno(self, tmp_dir):
+        f = Path(tmp_dir) / "lines.txt"
+        f.write_text("\n".join([f"line {i}" for i in range(1, 101)]), encoding="utf-8")
+
+        result = safe_read.read(str(f), tail=2)
+
+        assert result["ok"] is True
+        assert "    99│ line 99" in result["content"]
+        assert "   100│ line 100" in result["content"]
+
+    def test_include_metadata_default_false(self, tmp_dir):
+        f = Path(tmp_dir) / "a.txt"
+        f.write_text("x", encoding="utf-8")
+
+        result = safe_read.read(str(f))
+
+        assert result["ok"] is True
+        assert result["metadata"] == {}
+
+
+class TestLineNumberAccuracy:
+    """行号准确性：tail 大文件不得用估算值（行号会整体漂移）；估算时必须有标记。"""
+
+    def _skewed_big_file(self, tmp_dir):
+        """头部短行（估算样本区）+ 主体超长行 → 采样估算必然严重失真。"""
+        f = Path(tmp_dir) / "big.log"
+        with f.open("w", encoding="utf-8") as fh:
+            for _ in range(500):
+                fh.write("s\n")
+            for _ in range(3000):
+                fh.write("L" * 400 + "\n")
+        return f  # 真实总行数 3500，>1MB
+
+    def test_tail_large_file_exact_line_numbers(self, tmp_dir):
+        f = self._skewed_big_file(tmp_dir)
+
+        result = safe_read.read(str(f), tail=10)
+
+        assert result["ok"] is True
+        assert result["total_lines"] == 3500
+        assert result["start_line"] == 3491
+        assert result["total_lines_estimated"] is False
+        assert result["content"].split("\n")[0].startswith("  3491│ ")
+
+    def test_head_large_file_marks_estimated(self, tmp_dir):
+        f = self._skewed_big_file(tmp_dir)
+
+        result = safe_read.read(str(f), head=10)
+
+        assert result["ok"] is True
+        assert result["total_lines_estimated"] is True
+        # head 的行号本身是精确的（从第 1 行计）
+        assert result["content"].split("\n")[0].startswith("     1│ ")
+
+    def test_range_large_file_marks_estimated(self, tmp_dir):
+        f = self._skewed_big_file(tmp_dir)
+
+        result = safe_read.read(str(f), start_line=1, max_lines=50)
+
+        assert result["ok"] is True
+        assert result["total_lines_estimated"] is True
+
+    def test_small_file_not_estimated(self, tmp_dir):
+        f = Path(tmp_dir) / "small.txt"
+        f.write_text("a\nb\nc\n", encoding="utf-8")
+
+        for kwargs in ({}, {"head": 2}, {"tail": 2}, {"start_line": 1, "end_line": 2}):
+            result = safe_read.read(str(f), **kwargs)
+            assert result["ok"] is True
+            assert result["total_lines_estimated"] is False
+
+
 class TestFileReadNavigation:
     """safe_read 截断导航字段验证。"""
 
@@ -116,7 +219,7 @@ class TestFileReadNavigation:
         assert result["ok"] is True
         assert result["truncated"] is True
         assert result["next_call"]["tool"] == "safe_read"
-        assert result["next_call"]["args"]["start_line"] == 51
+        assert result["next_call"]["params"]["start_line"] == 51
         assert "Continue reading from line 51" in result["options"]
         assert any("tail=50" in opt for opt in result["options"])
 
@@ -130,7 +233,7 @@ class TestFileReadNavigation:
         assert result["header"]
         assert "lines 1-5 of 100" in result["footer"]
         assert "95 more below" in result["footer"]
-        assert result["next_call"]["args"]["start_line"] == 6
+        assert result["next_call"]["params"]["start_line"] == 6
 
     def test_tail_mode_navigation(self, tmp_dir):
         f = Path(tmp_dir) / "lines.txt"
@@ -142,7 +245,7 @@ class TestFileReadNavigation:
         assert result["header"]
         assert "lines 96-100 of 100" in result["footer"]
         assert "95 more above" in result["footer"]
-        assert result["next_call"]["args"]["end_line"] == 95
+        assert result["next_call"]["params"]["end_line"] == 95
 
     def test_no_footer_when_complete_file(self, tmp_dir):
         f = Path(tmp_dir) / "small.txt"
@@ -219,7 +322,7 @@ class TestFileReadDirectory:
         assert "dir_list" in result["options"]
         assert "dir_tree" in result["options"]
         assert result["next_call"]["tool"] == "dir_list"
-        assert Path(result["next_call"]["args"]["path"]).resolve() == d.resolve()
+        assert Path(result["next_call"]["params"]["path"]).resolve() == d.resolve()
 
     def test_read_directory_with_metadata(self, tmp_dir):
         d = Path(tmp_dir) / "testdir"
@@ -286,7 +389,7 @@ class TestFileReadMetadata:
         f = Path(tmp_dir) / "test.txt"
         f.write_text("hello world", encoding="utf-8")
         
-        result = safe_read.read(str(f))
+        result = safe_read.read(str(f), include_metadata=True)
         
         assert result["ok"] is True
         assert "metadata" in result
@@ -299,7 +402,7 @@ class TestFileReadMetadata:
         f = Path(tmp_dir) / "test.txt"
         f.write_text("x" * 2048, encoding="utf-8")
         
-        result = safe_read.read(str(f))
+        result = safe_read.read(str(f), include_metadata=True)
         
         assert result["ok"] is True
         assert result["human_size"] in ("2.0KB", "2KB")
@@ -428,7 +531,7 @@ class TestFileReadProposal:
         assert "proposal" in result
         assert "next_call" in result
         assert result["next_call"]["tool"] == "safe_read"
-        assert result["next_call"]["args"]["mode"] == "skeleton"
+        assert result["next_call"]["params"]["mode"] == "skeleton"
 
     def test_directory_returns_proposal(self, tmp_dir):
         d = Path(tmp_dir) / "testdir"
@@ -437,7 +540,7 @@ class TestFileReadProposal:
         assert result["ok"] is False
         assert "proposal" in result
         assert result["next_call"]["tool"] == "dir_list"
-        assert Path(result["next_call"]["args"]["path"]).resolve() == d.resolve()
+        assert Path(result["next_call"]["params"]["path"]).resolve() == d.resolve()
 
     def test_forbidden_path_returns_proposal(self):
         result = safe_read.read("C:/Windows/System32/kernel32.dll")
@@ -498,7 +601,7 @@ class TestFileReadValidation:
         result = safe_read.read(str(f), start_line=100)
         assert result["ok"] is False
         assert "超过" in result["error"]
-        assert result["next_call"]["args"]["tail"] == 3
+        assert result["next_call"]["params"]["tail"] == 3
 
     def test_invalid_line_range(self, tmp_dir):
         f = Path(tmp_dir) / "a.txt"
@@ -541,7 +644,7 @@ class TestLargeFilePaginationNextCall:
         assert result["next_call"] is not None, \
             "大文件截断时 next_call 不应为 None（否则 LLM 无法继续读取）"
         assert result["next_call"]["tool"] == "safe_read"
-        assert result["next_call"]["args"]["start_line"] == 201
+        assert result["next_call"]["params"]["start_line"] == 201
 
     def test_mid_file_range_on_large_file_has_next_call(self, tmp_dir):
         """大文件从中间用 max_lines 读取时 next_call 不能为 None。"""
@@ -554,7 +657,7 @@ class TestLargeFilePaginationNextCall:
         assert result["has_more"] is True
         assert result["next_call"] is not None, \
             "大文件中间截断时 next_call 不应为 None"
-        assert result["next_call"]["args"]["start_line"] == 5050
+        assert result["next_call"]["params"]["start_line"] == 5050
 
 
 class TestFindClosestLineIndent:

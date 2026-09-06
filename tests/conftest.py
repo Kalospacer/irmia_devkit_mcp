@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools import config as _tool_config
+from tools.tool_stats import reset as _reset_stats_fn
 
 
 @pytest.fixture(autouse=True)
@@ -22,7 +23,7 @@ def _reset_config():
 @pytest.fixture(autouse=True)
 def _auto_reset_stats():
     """每个测试前重置工具统计，确保测试隔离。"""
-    pass
+    _reset_stats_fn()
 
 
 @pytest.fixture

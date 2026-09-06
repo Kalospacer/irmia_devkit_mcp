@@ -154,6 +154,11 @@ def _fts_escape_token(s: str) -> str:
 
 # ── code graph engine ─────────────────────────────────
 
+# 已完成 DDL 初始化的 db_path 集合：二次打开同一库时跳过建表，仅做每连接的 PRAGMA。
+# 注意：只有 DDL 全部成功才会写入，DDL 失败不会把 path 留在集合里。
+_ENSURED: set[str] = set()
+
+
 class CodeGraph:
     def __init__(self, db_path: str):
         self._db_path = db_path
@@ -166,6 +171,21 @@ class CodeGraph:
             os.makedirs(db_dir, exist_ok=True)
         conn = sqlite3.connect(self._db_path)
         conn.execute("PRAGMA journal_mode=WAL")
+        key = os.path.abspath(self._db_path)
+        if key in _ENSURED:
+            # DDL 已在首次打开时执行过，直接复用（PRAGMA 是每连接的，仍需执行）
+            self._conn = conn
+            return
+        try:
+            self._create_schema(conn)
+        except Exception:
+            conn.close()
+            raise
+        _ENSURED.add(key)
+        self._conn = conn
+
+    @staticmethod
+    def _create_schema(conn: sqlite3.Connection) -> None:
         conn.execute("""CREATE TABLE IF NOT EXISTS symbols (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -203,7 +223,6 @@ class CodeGraph:
         except Exception as exc:
             logger.debug("codegraph suppressed error: %s", exc, exc_info=True)
         conn.commit()
-        self._conn = conn
 
     def _conn_get(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -286,6 +305,7 @@ class CodeGraph:
         changed_count = len(changed_files)
 
         # ── Parallel parsing + single-threaded batch write ──
+        fts_need_rebuild = False
         if changed_count > 0:
             worker_args = [(str(f), f.suffix.lower(), str(root)) for f in changed_files]
 
@@ -338,9 +358,12 @@ class CodeGraph:
                             "INSERT INTO sym_fts(name, file, signature) VALUES(?, ?, ?)",
                             [(s["name"], rp, s.get("signature", "")) for s in symbols],
                         )
-                    except Exception:
-                        pass
-                
+                    except Exception as exc:
+                        # 不再静默吞掉：标记后于收尾处全量重建 FTS，
+                        # 否则增量只删不补会让 FTS 与 symbols 表永久脱节、搜索漏结果。
+                        fts_need_rebuild = True
+                        logger.warning("codegraph: incremental FTS insert failed for %s, will rebuild FTS: %s", rp, exc)
+
                 stats["symbols"] += len(symbols)
                 stats["edges"] += len(edges)
                 stats["files"] += 1
@@ -351,13 +374,15 @@ class CodeGraph:
                                        "progress": f"{stats['files']}/{total_files}",
                                        "elapsed_s": round(time.time() - start, 1)})
             
-            # Full FTS5 rebuild if not incremental or too many changes
-            if not incremental or changed_count >= total_files * 0.5:
+            # Full FTS5 rebuild if not incremental or too many changes,
+            # or an incremental FTS insert failed (consistency fallback).
+            if not incremental or fts_need_rebuild or changed_count >= total_files * 0.5:
                 try:
                     conn.execute("DELETE FROM sym_fts")
                     conn.execute("INSERT INTO sym_fts(name, file, signature) SELECT name, file, signature FROM symbols")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # 重建失败必须可见：FTS 已与 symbols 脱节，后续搜索不可靠。
+                    logger.error("codegraph: FTS rebuild failed, full-text search may be inconsistent: %s", exc, exc_info=True)
 
         try:
             _resolve_references(conn)
@@ -398,14 +423,53 @@ class CodeGraph:
         if qtype == "trace_closed" and match and match.re.groups >= 2:
             return self._trace_path(conn, match.group(1).strip(), match.group(2).strip())
         if qtype == "trace_open":
-            return self._trace_open(conn, query)
-        if qtype == "symbol_search":
+            result = self._trace_open(conn, query)
+        elif qtype == "symbol_search":
             target = query
             for kw in _SEARCH_NOISE:
                 target = target.replace(kw, " ")
             target = re.sub(r"\s+", " ", target).strip()
-            return self._search_symbol(conn, target)
-        return self._explore_fallback(conn, query)
+            result = self._search_symbol(conn, target)
+        else:
+            result = self._explore_fallback(conn, query)
+        # 索引新鲜度：索引后被修改的文件会让返回的行号/位置漂移
+        if isinstance(result, dict) and result.get("ok"):
+            root = Path(self._db_path).resolve().parent.parent
+            result.setdefault("project_dir", str(root))
+            result.setdefault("path_note", "结果中的 file 为项目相对路径，调用 safe_read/safe_edit 前请与 project_dir 拼接")
+            stale = self._staleness(conn, _result_files(result))
+            if stale:
+                result["index_stale"] = True
+                result["stale_warning"] = (
+                    f"{stale} 个文件在索引后被修改，行号/调用位置可能已漂移，"
+                    "建议 code_index(incremental=true) 后重查"
+                )
+        return result
+
+    def _staleness(self, conn, files: list[str], limit: int = 50) -> int:
+        """统计 files 中 mtime 晚于 last_index 的数量（索引过期探测）。"""
+        row = conn.execute("SELECT value FROM meta WHERE key='last_index'").fetchone()
+        if not row:
+            return 0
+        try:
+            last_index = float(row[0])
+        except (TypeError, ValueError):
+            return 0
+        root = Path(self._db_path).resolve().parent.parent
+        stale = 0
+        seen: set[str] = set()
+        for f in files:
+            if not f or f in seen:
+                continue
+            seen.add(f)
+            if len(seen) > limit:
+                break
+            try:
+                if (root / f).resolve().stat().st_mtime > last_index:
+                    stale += 1
+            except OSError:
+                continue
+        return stale
 
     # ── search ────────────────────────────────────────
 
@@ -460,7 +524,7 @@ class CodeGraph:
             result["partial_path"] = partial["path"]
             result["break_at"] = partial["break_at"]
             result["break_reason"] = partial.get("reason", "BFS 未找到路径")
-            result["hint"] = f"断在 {partial['break_at']}——可能通过回调或动态调用连接。用 rg_search 确认。"
+            result["hint"] = f"断在 {partial['break_at']}——可能通过回调、动态调用或 AstrBot 框架路由连接。用 rg_search 确认。"
         else:
             result["hint"] = f"用 rg_search 搜索 {to_sym} 确认是否通过动态调用连接。"
         return result
@@ -478,12 +542,17 @@ class CodeGraph:
             return {"ok": True, "found": False, "query_type": "trace",
                     "summary": f"未找到与 '{query}' 相关的符号。"}
         sname = rows[0][0]
-        callers = [r[0] for r in conn.execute("SELECT from_sym FROM edges WHERE to_sym=? AND kind='calls' LIMIT 8", (sname,)).fetchall()]
-        callees = [r[0] for r in conn.execute("SELECT to_sym FROM edges WHERE from_sym=? AND kind='calls' LIMIT 8", (sname,)).fetchall()]
+        caller_rows = conn.execute("SELECT from_sym, file, line FROM edges WHERE to_sym=? AND kind='calls' LIMIT 50", (sname,)).fetchall()
+        callee_rows = conn.execute("SELECT to_sym, file, line FROM edges WHERE from_sym=? AND kind='calls' LIMIT 50", (sname,)).fetchall()
+        callers = [r[0] for r in caller_rows[:8]]
+        callees = [r[0] for r in callee_rows[:8]]
+        caller_locations = [{"name": r[0], "file": r[1], "line": r[2]} for r in caller_rows]
+        callee_locations = [{"name": r[0], "file": r[1], "line": r[2]} for r in callee_rows]
         sym_info = {"name": rows[0][0], "signature": rows[0][2], "file": rows[0][1]}
         return {"ok": True, "found": True, "query_type": "trace",
                 "summary": f"{sname} 的调用关系：{len(callers)} 调用者, {len(callees)} 被调用者。",
-                "symbol": sym_info, "callers": callers, "callees": callees}
+                "symbol": sym_info, "callers": callers, "callees": callees,
+                "caller_locations": caller_locations, "callee_locations": callee_locations}
 
     def _explore_fallback(self, conn, query: str) -> dict:
         symbols, strategy = self._search(conn, query)
@@ -664,9 +733,14 @@ class CodeGraph:
     # ── related symbols ───────────────────────────────
 
     def _get_related(self, conn, name: str) -> dict:
-        callers = [r[0] for r in conn.execute("SELECT from_sym FROM edges WHERE to_sym=? AND kind='calls' LIMIT 5", (name,)).fetchall()]
-        callees = [r[0] for r in conn.execute("SELECT to_sym FROM edges WHERE from_sym=? AND kind='calls' LIMIT 5", (name,)).fetchall()]
-        return {"callers": callers, "callees": callees}
+        caller_rows = conn.execute("SELECT from_sym, file, line FROM edges WHERE to_sym=? AND kind='calls' LIMIT 50", (name,)).fetchall()
+        callee_rows = conn.execute("SELECT to_sym, file, line FROM edges WHERE from_sym=? AND kind='calls' LIMIT 50", (name,)).fetchall()
+        return {
+            "callers": [r[0] for r in caller_rows[:5]],
+            "callees": [r[0] for r in callee_rows[:5]],
+            "caller_locations": [{"name": r[0], "file": r[1], "line": r[2]} for r in caller_rows],
+            "callee_locations": [{"name": r[0], "file": r[1], "line": r[2]} for r in callee_rows],
+        }
 
     # ── smart source truncation ───────────────────────
 
@@ -703,7 +777,7 @@ class CodeGraph:
             "total_lines": total,
             "header": f"符号 '{name}' 源码共 {total} 行，超过 {_TOP_SOURCE_FULL_LINES} 行，已展示 {_TOP_SOURCE_HEAD_LINES} 行头 + {_TOP_SOURCE_TAIL_LINES} 行尾。",
             "footer": "需要完整源码请调用 code_pack。",
-            "next_call": {"tool": "code_pack", "args": {"target": name}},
+            "next_call": {"tool": "code_pack", "params": {"target": name}},
             "options": [f"code_pack('{name}')"],
         }
 
@@ -718,9 +792,7 @@ class CodeGraph:
             row = conn.execute("SELECT value FROM meta WHERE key='project_dir'").fetchone()
             if row:
                 try:
-                    # tempfile paths on macOS commonly use /var while resolve()
-                    # canonicalizes the indexed root to /private/var.
-                    rel = Path(fp).resolve().relative_to(Path(row[0]).resolve())
+                    rel = Path(fp).relative_to(Path(row[0]))
                     posix = rel.as_posix()
                     candidates.add(posix)
                     candidates.add(posix.replace("/", "\\"))
@@ -816,8 +888,19 @@ class CodeGraph:
             if total_lines > _PACK_MAX_LINES:
                 break
 
-        return {"ok": True, "target": target_info, "dependencies": deps, "total_lines": total_lines,
-                "truncated": total_lines > _PACK_MAX_LINES}
+        result = {"ok": True, "target": target_info, "dependencies": deps, "total_lines": total_lines,
+                "truncated": total_lines > _PACK_MAX_LINES,
+                "project_dir": str(Path(self._db_path).resolve().parent.parent),
+                "path_note": "结果中的 file 为项目相对路径，调用 safe_read/safe_edit 前请与 project_dir 拼接"}
+        # 索引新鲜度：打包的源码/行号来自索引，索引后修改的文件内容会漂移
+        stale = self._staleness(conn, [target_info["file"]] + [d["file"] for d in deps])
+        if stale:
+            result["index_stale"] = True
+            result["stale_warning"] = (
+                f"{stale} 个文件在索引后被修改，打包的源码/行号可能已漂移，"
+                "建议 code_index(incremental=true) 后重查"
+            )
+        return result
 
     # ── code_status ───────────────────────────────────
 
@@ -1256,11 +1339,14 @@ def _resolve_references(conn):
     for (qn,) in conn.execute("SELECT name FROM symbols").fetchall():
         short = qn.rsplit(".", 1)[-1]
         name_index[short].append(qn)
-    for eid, to_sym, _ in conn.execute("SELECT id, to_sym, kind FROM edges WHERE kind='calls'").fetchall():
+    updates: list[tuple[str, int]] = []
+    for eid, to_sym, _ in conn.execute("SELECT id, to_sym, kind FROM edges WHERE kind='calls' AND resolved=0").fetchall():
         if "." not in to_sym and to_sym in name_index:
             candidates = name_index[to_sym]
             if len(candidates) == 1:
-                conn.execute("UPDATE edges SET to_sym=?, resolved=1 WHERE id=?", (candidates[0], eid))
+                updates.append((candidates[0], eid))
+    if updates:
+        conn.executemany("UPDATE edges SET to_sym=?, resolved=1 WHERE id=?", updates)
 
     # Phase 2: cross-file import resolution (optimized: batch resolve)
     from collections import defaultdict as dd2
@@ -1293,6 +1379,7 @@ def _resolve_references(conn):
         "WHERE e.kind='calls' AND e.resolved=0"
     ).fetchall()
 
+    updates = []
     for eid, from_sym, to_sym, from_file in unresolved:
         imports = file_imports.get(from_file)
         if not imports:
@@ -1313,13 +1400,16 @@ def _resolve_references(conn):
             # fallback: original prefix matching on dotted symbol names
             candidates.update(symbol_prefix_map.get((imp, to_sym), []))
         if len(candidates) == 1:
-            conn.execute("UPDATE edges SET to_sym=?, resolved=1 WHERE id=?", (candidates.pop(), eid))
+            updates.append((candidates.pop(), eid))
+    if updates:
+        conn.executemany("UPDATE edges SET to_sym=?, resolved=1 WHERE id=?", updates)
 
     # Phase 3: self.method() / cls.method() resolution
     unresolved = conn.execute(
         "SELECT e.id, e.from_sym, e.to_sym FROM edges e "
         "WHERE e.kind='calls' AND e.resolved=0 AND e.to_sym NOT LIKE '%.%' AND e.to_sym NOT LIKE '%(%'"
     ).fetchall()
+    updates = []
     for eid, from_sym, to_sym in unresolved:
         cls_prefix = _class_of(from_sym)
         if not cls_prefix:
@@ -1327,7 +1417,9 @@ def _resolve_references(conn):
         candidate = f"{cls_prefix}.{to_sym}"
         sr = conn.execute("SELECT name FROM symbols WHERE name=? LIMIT 1", (candidate,)).fetchone()
         if sr:
-            conn.execute("UPDATE edges SET to_sym=?, resolved=1 WHERE id=?", (sr[0], eid))
+            updates.append((sr[0], eid))
+    if updates:
+        conn.executemany("UPDATE edges SET to_sym=?, resolved=1 WHERE id=?", updates)
 
 
 # ── BFS ───────────────────────────────────────────────
@@ -1337,6 +1429,30 @@ def _class_of(qualified_name: str) -> str | None:
         return None
     parts = qualified_name.rsplit(".", 1)
     return parts[0]
+
+def _result_files(result: dict) -> list[str]:
+    """从 explore 结果中收集涉及的文件路径（用于索引过期探测）。"""
+    files: list[str] = []
+
+    def _add(loc):
+        if isinstance(loc, dict):
+            f = loc.get("file")
+            if f:
+                files.append(f)
+
+    for s in result.get("symbols") or []:
+        _add(s)
+    grouped = result.get("grouped_by_file")
+    if isinstance(grouped, dict):
+        files.extend(str(k) for k in grouped.keys())
+    for container in (result, result.get("related_symbols")):
+        if not isinstance(container, dict):
+            continue
+        for key in ("caller_locations", "callee_locations"):
+            for loc in container.get(key) or []:
+                _add(loc)
+    return files
+
 
 def _bfs_path(conn, start: str, end: str, max_depth: int = 6) -> list[str] | None:
     from collections import deque
@@ -1370,7 +1486,7 @@ def _bfs_partial(conn, start: str, end: str, max_depth: int = 8) -> dict | None:
         rows = conn.execute("SELECT to_sym FROM edges WHERE from_sym=? AND kind IN ('calls','extends','triggers','imports')", (node,)).fetchall()
         if not rows:
             return {"path": path, "break_at": node,
-                    "reason": f"{node} 没有静态调用出边（可能通过回调或动态调用连接）"}
+                    "reason": f"{node} 没有静态调用出边（可能通过回调、动态调用或 AstrBot 框架路由连接）"}
         for (nxt,) in rows:
             if nxt == end:
                 return {"path": path + [nxt], "break_at": "", "reason": "found"}

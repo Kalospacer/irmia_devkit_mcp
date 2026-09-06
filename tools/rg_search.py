@@ -7,10 +7,9 @@ import os
 import re
 import subprocess
 import shutil
+from pathlib import Path
 
 from ._helpers import proposal_reply
-from ._vendor import bundled_executable
-from .config import get_config
 
 # 扫描时跳过的目录名
 _SKIP_DIRS = {
@@ -33,14 +32,7 @@ def _has_nested_quantifiers(pattern: str) -> bool:
 
 
 def _find_rg() -> str | None:
-    """查找 rg 可执行文件路径：配置 → 已校验内置版本 → PATH。
-    跨平台：Linux/macOS 优先原生 rg，Windows 优先 rg.exe。"""
-    custom = get_config().get("rg_path", "")
-    if custom and os.path.isfile(custom):
-        return custom
-    bundled = bundled_executable("rg")
-    if bundled:
-        return bundled
+    """查找 rg 可执行文件路径，未找到返回 None。"""
     return shutil.which("rg")
 
 
@@ -60,7 +52,7 @@ def _parse_rg_output(stdout: str) -> list[dict]:
             lineno = int(m.group(2))
         except ValueError:
             continue
-        matches.append({"file": m.group(1), "line": lineno, "content": m.group(3)})
+        matches.append({"file": m.group(1), "line": lineno, "content": m.group(3)[:200]})
     return matches
 
 
@@ -89,7 +81,7 @@ def _parse_rg_with_context(stdout: str) -> list[dict]:
         sep1 = m.group(2)  # : for match, - for context
         lineno = m.group(3)
         sep2 = m.group(4)  # : for match, - for context
-        text = m.group(5)
+        text = m.group(5)[:200]
         if sep1 == ":" and sep2 == ":":
             # This is a match line: file:line:content
             if current:
@@ -283,6 +275,8 @@ def search(
             options=["提供非空搜索词"],
         )
 
+    context_lines = min(max(0, int(context_lines)), 10)
+
     search_path = os.path.abspath(path)
     if not os.path.isdir(search_path):
         return {"ok": False, "error": f"目录不存在: {search_path}"}
@@ -301,6 +295,9 @@ def search(
                 args.append("--word-regexp")
             if list_files:
                 args.append("--files-with-matches")
+            else:
+                # 只多读 1 条用于判断 truncated，避免超大结果集全量读入内存
+                args.extend(["-m", str(max_results + 1)])
 
             for ext in exts:
                 args.extend(["-g", f"*.{ext}"])

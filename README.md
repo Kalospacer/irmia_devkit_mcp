@@ -1,166 +1,220 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/irmia2026/irmia_devkit_open/main/logo.png" width="120" alt="Irmia DevKit" />
-</p>
+# 弥亚开发工具箱 (Irmia DevKit)
 
-<h1 align="center">Irmia DevKit MCP</h1>
+AstrBot 插件，为 LLM Agent 提供代码开发工具集。
 
-<p align="center">
-  <strong>44 permission-annotated development tools for AI coding agents — localhost transport, zero-config setup.</strong><br />
-  <sub>Safe editing · Semantic code index · File search · Test runner · System info</sub>
-</p>
+Python ≥ 3.10
 
-<p align="center">
-  <a href="https://github.com/irmia2026/irmia_devkit_mcp/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" /></a>
-  <a href="#"><img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" /></a>
-  <a href="#"><img src="https://img.shields.io/badge/MCP-1.0%2B-green.svg" /></a>
-  <a href="#"><img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" /></a>
-</p>
+## 安装
 
-<p align="center">
-  <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
-</p>
+将插件文件夹放入 AstrBot 的 `data/plugins/` 目录，重启 AstrBot。
 
----
+## 配置
 
-`irmia_devkit_mcp` packages 44 battle-tested development tools from [`irmia_devkit_open`](https://github.com/irmia2026/irmia_devkit_open) as a standalone [Model Context Protocol](https://modelcontextprotocol.io/) server. It also declares the companion `dev-workflow` Skill through `reasonix-plugin.json`, so plugin-aware hosts can install the tools and their safe coding workflow together. Any MCP-compatible agent — Claude Code, Cursor, Codex, Windsurf — can call `safe_edit`, `code_explore`, `rg_search` and friends as first-class tools, with hardened security defaults out of the box.
+首次启动时自动生成 `config.json`。也可通过 AstrBot WebUI 面板配置。修改工具组开关后需重启生效。
 
-## Why this server
+| 字段 | 说明 |
+|------|------|
+| `owner_sid` | 管理员会话 ID（可不填，插件自动读取 AstrBot 管理员列表） |
+| `allowed_ids` | 额外允许的用户 ID（逗号分隔，平台无关） |
+| `group_config_enabled` | 启用群级权限配置（默认关闭，需重启生效） |
+| `tool_groups` | 10 组 bool 开关，`false` = 关闭整组 |
+| `disabled_tools` | 逗号分隔单独禁用的工具名 |
+| `es_path` | Everything CLI 路径，空自动检测 |
+| `gh_path` | GitHub CLI 路径，空自动检测 |
+| `backup_dir` | safe_edit 备份目录，空 → `~/.irmia/backups` |
 
-| Feature | What it means |
-|---------|---------------|
-| 🔒 **Local transport** | Refuses non-loopback HTTP binds. MCP clients may still send tool inputs and outputs to their configured model provider. |
-| ⚡ **Zero config** | Includes verified x86-64 search binaries for Windows/Linux, then falls back to PATH or pure Python on other platforms. |
-| 🛡️ **Defense in depth** | Four-layer SSRF filtering, automatic edit backups with rollback, unified path-traversal checks on every file operation. |
-| 🧠 **Semantic index** | Python AST + SQLite FTS5 — symbol search, call chains, and impact analysis in milliseconds. |
-| 📦 **44 tools** | Editing, search, testing, code intelligence, networking, files, encoding, time, text processing, system info. |
-| 🌍 **Cross-platform** | Windows, Linux, macOS, with platform-native launchers and executable resolution. |
+## 前置依赖
 
-## Quick start
+| 工具 | 依赖 | 未安装时 |
+|------|------|----------|
+| `es_search` | Everything + es.exe (Windows) / locate / fd | 返回错误提示或 Python os.walk 扫描 |
+| `gh_pr` / `gh_issue` / `gh_release` / `gh_repo` | GitHub CLI | 返回错误提示 |
+| `html_extract` | `beautifulsoup4`，lxml 可选 | 缺 bs4 报错，缺 lxml 回退 html.parser |
+| `syntax_check` (Nim/Go/JS/TS) | 对应编译器 | 跳过 (skipped=true) |
+| `lint_runner` | ruff / pylint / eslint 任一（自动 fallback） | 返回安装提示 |
+| `rg_search` | ripgrep（可选），未安装时 Python fallback | 降级到纯标库扫描 |
+| `config_diff` (YAML) | pyyaml（可选） | 返回安装提示 |
+| `code_index` (多语言) | tree-sitter + grammar（可选） | Python 零依赖；其他语言跳过 |
 
-**Requirements:** Python ≥ 3.10 (on Windows, either check *Add python.exe to PATH* during installation or install the `py` launcher). The launchers call one standard-library Python bootstrap, which creates a project-local `.venv` on first launch and installs dependencies into it — nothing touches your global site-packages. npm commands use the included Node launcher to locate Python correctly on each platform. This first launch writes under the plugin directory and requires network access to PyPI unless the pinned dependencies are already installed in that venv.
+> 其余 50+ 工具为 Python 标准库实现，无外部依赖。
 
-Reasonix users can preview the combined Skill + MCP plugin before installation:
+## 设计说明
+
+`safe_edit` 提供了备份→精确替换→whitespace-tolerant 模糊匹配→语法检查→失败自动回滚的五步编辑流程。当 LLM 传的 old 文本差一两格缩进时，自动对齐行首空白后重试匹配（对标 Aider），避免多一轮交互。多处匹配时返回所有位置的 `{行号, 列号, 预览}` 并提示用 `occurrence=N` 消歧。
+
+**权限控制**: 插件采用双层防线：`on_llm_request` 钩子从 `req.func_tool` 中移除本插件工具（非管理员 LLM 不可见）+ `protect_tool` 在每个工具的 `call()` 入口做二次鉴权。自动读取 AstrBot 全局管理员列表，无需重复配置。
+
+部分工具（`git_commit`、`syntax_check`、`port_check`、`es_search`、`lint_runner`、`dep_scan` 等 17 个）在失败或歧义时返回 `{proposal, evidence, options, next_call}` 结构化信息，替代纯文本错误。
+
+`syntax_check`/`lint_runner`/`rg_search` 在返回结果中附带代码上下文片段，帮助 LLM 直接定位问题，无需额外读文件。
+
+65 个工具按 10 组管理，可在 `config.json` 中按组或按单个工具关闭。
+
+## 架构
+
+详见 [ARCHITECTURE.md](ARCHITECTURE.md)，包含：
+- 模块依赖关系图和初始化流程
+- 如何新增工具的完整步骤
+- 响应协议规范（三种 JSON shape）
+- 安全设计架构（SSRF 四层、safe_edit 防御链、ReDoS 三重盾）
+- 异步执行模型和测试策略
+
+## 工具列表 (65)
+
+### 🔒 安全编辑链 (10)
+
+| 工具 | 用途 |
+|------|------|
+| `safe_edit` | 备份→替换→语法检查→通过保留/失败回滚；支持行号插入/删行模式，自动剥除误复制的行号前缀 |
+| `safe_write` | 新建文件/整体覆盖写入，自动创建父目录，语法检查 |
+| `safe_rollback` | 回滚到指定或最近备份 |
+| `safe_backups` | 列出备份文件（自动保留策略：每文件 10 份 + 500MB LRU） |
+| `file_patch` | 精确文本替换，非代码文件用，支持 occurrence 消歧 |
+| `file_preview` | 预览替换效果 (dry-run diff) |
+| `syntax_check` | Python / Nim / Go / JS / TS 语法 |
+| `lint_runner` | ruff / pylint / eslint 代码质量 |
+| `test_runner` | pytest / go test / cargo test / jest 统一运行 |
+| `multi_edit` | 原子多文件编辑，失败全量回滚 |
+
+### 🔀 Git & GitHub (11)
+
+| 工具 | 用途 |
+|------|------|
+| `git_status` | 仓库状态 (--porcelain) |
+| `git_diff` | 工作区/暂存区差异 |
+| `git_log` | 最近 N 条提交 |
+| `git_commit` | 暂存并提交（>10 文件拦截；files 选择性暂存 / force 强制） |
+| `git_branch` | 当前分支 |
+| `git_remote` | 远程 URL |
+| `git_push` | 推送（无 --force） |
+| `gh_pr` | PR：创建/列出/合并/查看 |
+| `gh_issue` | Issue：创建/列出/关闭 |
+| `gh_release` | Release：创建/列出 |
+| `gh_repo` | 仓库：创建/查看/CI 状态/CI 日志/认证 |
+
+### 📁 文件系统 (12)
+
+| 工具 | 用途 |
+|------|------|
+| `safe_read` | 增强版安全文件读取：编码自动检测、行号前缀、二进制/hex、head/tail、行号范围、代码骨架 |
+| `es_search` | Everything/locate/fd 文件名搜索 |
+| `rg_search` | 文件内容搜索（ripgrep + Python fallback） |
+| `dir_tree` | 目录树 |
+| `dir_list` | 目录列表 |
+| `file_diff` | 文件差异比较 |
+| `file_hash` | MD5 / SHA1 / SHA256 |
+| `file_zip` | ZIP 打包 |
+| `file_unzip` | ZIP 解压（Zip-slip 防护） |
+| `file_remove` | 删除文件/目录（沙箱+批量确认） |
+| `disk_info` | 磁盘分区使用情况 |
+| `config_diff` | 配置文件 key 级差异 |
+
+### 📊 系统信息 (4)
+
+| 工具 | 用途 |
+|------|------|
+| `port_check` | 端口检测（含延迟）/ 批量扫描 |
+| `proc_list` | 进程列表 |
+| `sys_snapshot` | 系统快照 (CPU/内存/进程/开机) |
+| `tool_stats` | 工具调用统计 |
+
+### 🧾 执行与审计 (2)
+
+| 工具 | 用途 |
+|------|------|
+| `shell_exec` | 严格白名单命令执行（测试/构建、超时、截断） |
+| `op_log` | SQLite 工具调用审计日志查询 |
+
+### 🌐 网络 (3)
+
+| 工具 | 用途 |
+|------|------|
+| `http_get` | HTTP GET + HTML→Markdown 正文提取 (SSRF 防护，默认 markdown 分页) |
+| `http_post` | HTTP POST |
+| `http_download` | 二进制下载 (500MB 上限 + 路径沙箱) |
+
+### 📝 文本处理 (8)
+
+| 工具 | 用途 |
+|------|------|
+| `html_extract` | HTML → 文本/链接/表格 |
+| `json_query` | jq 式 JSON 路径查询 |
+| `text_filter` | 行过滤 (grep/head/tail/count) |
+| `diff_strings` | 字符串 unified diff |
+| `csv_parse` | CSV/TSV → 结构化数据 |
+| `csv_gen` | 结构化 → CSV/TSV |
+| `md_strip` | Markdown → 纯文本 |
+| `log_parse` | Nginx/Apache/syslog/JSON Lines |
+
+### 🔤 编码 & ⏱ 时间 (2)
+
+| 工具 | 用途 |
+|------|------|
+| `encode_decode` | Base64 / URL / Hex 编解码（action + format） |
+| `time` | 当前时间 / 时间戳↔ISO 互转 / 时间差（action） |
+
+### 🧩 扩展 (6)
+
+| 工具 | 用途 |
+|------|------|
+| `semver_compare` | 语义版本比较 |
+| `uuid_gen` | UUID / hex / token |
+| `project_init` | 项目结构扫描 |
+| `git_changelog` | git log 九类前缀分类 |
+| `db_query` | SQLite 只读查询（200 行截断保护） |
+| `dep_scan` | Python 依赖图 + 循环检测 |
+
+### 🤖 代码理解 (6)
+
+| 工具 | 用途 |
+|------|------|
+| `code_index` | 建立项目语义索引（符号+调用链） |
+| `code_explore` | 自然语言探索代码库结构 |
+| `code_diff_impact` | 变更影响分析——追踪波及范围 |
+| `code_pack` | 精准上下文打包——收集调用链源码 |
+| `code_status` | 索引健康检查——覆盖范围和状态 |
+| `symbol_rename` | Python 符号重命名（codegraph + token 替换） |
+
+### 🧠 Skill
+
+| 名称 | 触发 |
+|------|------|
+| `dev-workflow` | 编码/改代码/修 bug/重构任务 |
+
+## 快速上手
+
+改代码的标准流程：
+
+```
+git_status(cwd=".")               # 确认工作区干净
+rg_search(pattern="old_func", file_exts="py")  # 找到所有引用
+safe_edit(filepath="main.py",     # 执行编辑
+          old="x = 1",
+          new="x = 42")
+syntax_check(filepath="main.py")  # 验证语法
+lint_runner(filepath="main.py")   # 检查代码质量
+git_diff(cwd=".", staged=true)    # 自查改动
+git_commit(cwd=".",               # 提交
+           message="refactor: replace old_func with new_func")
+```
+
+## 测试
 
 ```bash
-reasonix plugin install https://github.com/irmia2026/irmia_devkit_mcp --dry-run
-reasonix plugin install https://github.com/irmia2026/irmia_devkit_mcp --yes
+pip install pytest
+python -m pytest tests/ -v
 ```
 
-The native Reasonix manifest works on Linux/macOS. Reasonix v1.17.18 does not yet wrap plugin-local `.cmd` MCP commands with `cmd.exe` on Windows; Windows users should use the npm launcher or configure `python server.py` directly until the host adds batch-command wrapping.
+209 用例起步；当前本地验证为 678 passed、8 skipped。覆盖 SSRF、safe_edit 防御链、Zip-slip、SQL 注入、ReDoS、注册表一致性、linter/test fallback、权限鉴权、语义索引、原子编辑、安全命令执行和审计日志等。
 
-```bash
-git clone https://github.com/irmia2026/irmia_devkit_mcp.git
-cd irmia_devkit_mcp
-bin/irmia-devkit.sh        # Linux/macOS
-bin\irmia-devkit.cmd       # Windows — or: npx irmia-devkit-mcp
-```
+## 英文文档
 
-On first launch the server scans `vendor/` and PATH for `rg` / `fd` / `es` and writes `~/.irmia/mcp_config.json`. Point your MCP client at the launcher script (or `server.py`):
+[English README](README_EN.md)
 
-### Cursor — `~/.cursor/mcp.json`
+## 版本
 
-```json
-{
-  "mcpServers": {
-    "irmia-devkit": {
-      "command": "python",
-      "args": ["D:\\path\\to\\irmia_devkit_mcp\\server.py"]
-    }
-  }
-}
-```
+2.6.4 · [Changelog](CHANGELOG.md)
 
-### Claude Desktop — `~/.claude/settings.json`
+## 作者
 
-```json
-{
-  "mcpServers": {
-    "irmia-devkit": {
-      "command": "python",
-      "args": ["/path/to/irmia_devkit_mcp/server.py"]
-    }
-  }
-}
-```
-
-### HTTP mode (local browser clients)
-
-```bash
-python server.py --http --port 8000
-# → http://127.0.0.1:8000/mcp
-```
-
-> ⚠️ `--host` only accepts `127.0.0.1` / `localhost` / `::1`. Remote binding is rejected at startup — this is by design, not a bug.
-
-## Tool overview
-
-| # | Group | Tools |
-|---|-------|-------|
-| 10 | 🔒 Safe editing | `safe_edit` `safe_write` `safe_backups` `safe_rollback` `file_patch` `file_preview` `syntax_check` `lint_runner` `test_runner` `multi_edit` |
-| 13 | 📂 Filesystem | `safe_read` `es_search` `rg_search` `dir_tree` `dir_list` `file_diff` `file_hash` `file_zip` `file_unzip` `file_move` `file_remove` `disk_info` `config_diff` |
-| 6 | 🧠 Code intelligence | `code_index` `code_explore` `code_pack` `code_diff_impact` `code_status` `symbol_rename` |
-| 3 | 📊 System info | `port_check` `proc_list` `sys_snapshot` |
-| 4 | 📝 Text processing | `html_extract` `json_query` `text_filter` `diff_strings` |
-| 5 | 🔧 Encoding / time / misc | `encode_decode` `time` `db_query` `dep_scan` `uuid_gen` |
-| 3 | 🌐 Networking | `http_get` `http_post` `http_download` |
-
-## Bundled search tools and resolution
-
-Runtime search order is: **environment/manual configuration → verified project `vendor/` → PATH → pure-Python fallback**. The repository bundles upstream x86-64 releases of ripgrep and fd for Windows/Linux plus Everything CLI for Windows. Archive URLs, archive hashes, extraction members, licenses, and extracted-file SHA-256 hashes are recorded in [`vendor/README.txt`](vendor/README.txt), [`vendor/SHA256SUMS`](vendor/SHA256SUMS), and [`vendor/THIRD_PARTY_LICENSES.txt`](vendor/THIRD_PARTY_LICENSES.txt); packaging tests pin every extracted hash. macOS, ARM, and other unsupported targets automatically use PATH or the Python fallback.
-
-```json
-// ~/.irmia/mcp_config.json (auto-generated, user-editable)
-{
-  "es_path": "D:\\path\\to\\irmia_devkit_mcp\\vendor\\es.exe",
-  "rg_path": "D:\\path\\to\\irmia_devkit_mcp\\vendor\\rg.exe",
-  "fd_path": "D:\\path\\to\\irmia_devkit_mcp\\vendor\\fd.exe",
-  "backup_dir": "C:\\Users\\...\\.irmia\\backups"
-}
-```
-
-| Tool | Windows | Linux / macOS | No external dependency |
-|------|---------|---------------|------------------------|
-| `es_search` | Everything CLI (requires the Everything service) | `locate` → `fd` → Python fallback | Python `os.walk` |
-| `rg_search` | ripgrep | ripgrep | Pure-Python scanner |
-
-Precedence: environment variable (`IRMIA_ES_PATH`, `IRMIA_RG_PATH`, `IRMIA_FD_PATH`, `IRMIA_BACKUP_DIR`) → manual `mcp_config.json` values → auto-scan → built-in defaults.
-
-## Security model
-
-| Layer | Mechanism |
-|-------|-----------|
-| Editing | Backup → replace → syntax check → rollback on failure |
-| Network | SSRF defense in depth: scheme allowlist, IP-range blocklist, DNS answer pinning, proxy bypass, and per-redirect re-validation |
-| SQL | `db_query` read-only, SELECT/PRAGMA allowlist, parameterized queries |
-| Paths | `..` traversal rejection + canonical prefix validation + filesystem-root, user-home, and system-directory blocklist |
-| Deployment | Non-localhost binding refused at startup |
-| Startup | The source/plugin launcher may create `.venv`, install pinned direct dependencies from PyPI, and write detected-tool configuration under `~/.irmia/` |
-
-### Required capabilities and data flow
-
-This server is intentionally powerful. Depending on the selected tool, it can read, create, overwrite, move, archive, or delete local files; execute test and lint subprocesses; inspect process, port, disk, and system metadata; and make outbound HTTP requests or downloads. The MCP schema marks read-only, mutating, destructive, and open-world tools explicitly so compatible hosts can apply the appropriate approval policy. Tool results are returned to the MCP client and may be transmitted to the model provider configured by that client.
-
-## Documentation
-
-| Document | Contents |
-|----------|----------|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Project layout, data flow, design decisions |
-| [CHANGELOG.md](CHANGELOG.md) | Version history (Keep a Changelog) |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Adding tools, return-value conventions, security checklist |
-| [LICENSE](LICENSE) | AGPL-3.0 |
-| [vendor/THIRD_PARTY_LICENSES.txt](vendor/THIRD_PARTY_LICENSES.txt) | Licenses for bundled search binaries |
-
-## FAQ
-
-**How does this relate to `irmia_devkit_open`?**
-`irmia_devkit_mcp` is the MCP-packaged edition. Tool implementations are synced from upstream; the server runs standalone without AstrBot.
-
-**What do I need to install?**
-Python ≥ 3.10. The launchers install the exact versions in `requirements.txt` into a project-local virtual environment. Bundled search binaries accelerate supported x86-64 systems but are never required.
-
-**Can I deploy this on a shared server?**
-No — by design. The server only binds to localhost, and every filesystem tool operates on the machine it runs on. Shared deployment would leak host paths and file contents.
-
-## License
-
-AGPL-3.0 © irmia2026
+伊尔弥亚 (irmia2026) · https://github.com/irmia2026/irmia_devkit_open

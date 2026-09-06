@@ -13,22 +13,14 @@ import shutil
 from pathlib import Path
 from .config import get_config
 from ._helpers import proposal_reply, _run_cmd
-from ._vendor import bundled_executable
-
-IS_WINDOWS = os.name == "nt"
 
 
 def _get_es_path() -> str:
-    """获取 es.exe 路径：配置 → 已校验内置版本 → PATH → 默认 es。"""
+    """获取 es.exe 路径：配置优先 → PATH 自动查找 → 默认路径"""
     config = get_config()
     custom = config.get("es_path", "")
     if custom and os.path.exists(custom):
         return custom
-
-    bundled = bundled_executable("es")
-    if bundled:
-        return bundled
-
     found = shutil.which("es")
     if found:
         return found
@@ -55,20 +47,18 @@ _POSIX_SKIP_DIRS = {
 _MAX_POSIX_FILES = 10000
 
 
-def _find_fd() -> str | None:
-    """Resolve fd using configured path, verified bundle, then PATH."""
-    custom = get_config().get("fd_path", "")
-    if custom and os.path.isfile(custom):
-        return custom
-    return bundled_executable("fd") or shutil.which("fd")
-
-
 def _posix_search(
     query: str, path: str | None = None, max_results: int = 100,
     case_sensitive: bool = False, file_type: str = "all", ext: str | None = None,
 ) -> dict:
     """Linux/macOS 文件名搜索：locate → fd → os.walk 三层 fallback。"""
-    search_root = path or "/"
+    if path:
+        search_root = path
+    elif os.name == "nt":
+        # Windows 上 "/" 无意义，默认搜索用户主目录
+        search_root = str(Path.home())
+    else:
+        search_root = "/"
 
     # --- Layer 1: locate ---
     locate_path = shutil.which("locate")
@@ -90,7 +80,7 @@ def _posix_search(
             pass
 
     # --- Layer 2: fd ---
-    fd_path = _find_fd()
+    fd_path = shutil.which("fd")
     if fd_path:
         try:
             type_arg = "f" if file_type == "file" else ("d" if file_type == "folder" else None)
@@ -241,12 +231,21 @@ def search(
     """
     es_path = _get_es_path()
     if not Path(es_path).exists():
-        return _posix_search(query, path, max_results, case_sensitive, file_type, ext)
+        result = _posix_search(query, path, max_results, case_sensitive, file_type, ext)
+        extra_notes = []
+        if not path and os.name == "nt":
+            extra_notes.append(f"未指定 path，Windows 下默认搜索用户主目录: {Path.home()}")
+        if regex or whole_word or sort_by:
+            extra_notes.append("POSIX fallback 不支持 regex/whole_word/sort_by，已按字面量搜索")
+        if extra_notes:
+            existing = result.get("note", "")
+            result["note"] = "；".join(n for n in [existing, *extra_notes] if n)
+        return result
 
     args = [es_path]
 
     if query.startswith(("/", "-")) and not regex:
-        return {"ok": False, "error": "query 不能以 / 或 - 开头（会被 es.exe 解释为选项）。regular 搜索请用 regex=True。"}
+        return {"ok": False, "error": "query 不能以 / 或 - 开头（会被 es.exe 解释为选项）。正则搜索请用 regex=True。"}
 
     if regex:
         args.extend(["-r", query])
@@ -292,9 +291,26 @@ def search(
     # --- 执行 ---
     proc = _run_cmd(args, timeout=15)
     if not proc["ok"]:
-        # es.exe 失败时回退到 Python 搜索（如 CI 环境没有 Everything 服务）
-        return _python_fallback_search(query, path or ".", max_results,
-                                       case_sensitive, file_type, ext)
+        err_msg = proc.get("error", "")
+        if "超时" in err_msg:
+            return proposal_reply(
+                False,
+                "Everything 搜索超时 (15s)——尝试缩小搜索范围",
+                error="es.exe 搜索超时（15s）",
+                evidence={"query": query, "timeout": 15},
+                options=["缩小 path 范围", "简化 query 通配符", "回退到 dir_list"],
+                next_call={"tool": "dir_list", "params": {"path": path or "."}},
+            )
+        if "不存在" in err_msg or "未安装" in err_msg:
+            return proposal_reply(
+                False,
+                "es.exe 未找到",
+                error=err_msg,
+                evidence={"query": query},
+                options=["检查 query 语法", "回退到 dir_list"],
+                next_call={"tool": "dir_list", "params": {"path": path or "."}},
+            )
+        return {"ok": False, "error": proc.get("stderr", "") or f"es.exe 返回码 {proc.get('code')}"}
 
     # --- 解析 CSV ---
     reader = csv.DictReader(io.StringIO(proc["stdout"]))

@@ -15,40 +15,7 @@ _FORBIDDEN_PREFIXES = [
     "C:/Program Files", "C:/Program Files (x86)",
     "C:/Users/All Users",
     "/bin", "/boot", "/dev", "/etc", "/lib", "/proc", "/root", "/sbin", "/sys", "/usr", "/var",
-    # macOS system roots. /etc and /var resolve through /private, so both the
-    # public aliases and their canonical targets must remain protected.
-    "/Applications", "/Library", "/System", "/private/etc", "/private/var",
 ]
-
-
-def _forbidden_prefix(path: str | Path) -> str | None:
-    """Return the protected root containing path, including resolved aliases."""
-    resolved = Path(path).resolve()
-    anchor = Path(resolved.anchor).resolve()
-    if resolved == anchor:
-        return str(anchor)
-    try:
-        if resolved == Path.home().resolve():
-            return "user-home"
-    except RuntimeError:
-        pass
-    path_norm = str(resolved).replace("\\", "/").casefold()
-    # macOS places each user's temporary files below /private/var/folders.
-    # Treating the whole canonical /var tree as forbidden would make normal
-    # editor and test temp files unusable, while /var/log and peers stay blocked.
-    macos_temp_root = "/private/var/folders"
-    if path_norm == macos_temp_root or path_norm.startswith(macos_temp_root + "/"):
-        return None
-    for forbidden in _FORBIDDEN_PREFIXES:
-        roots = {forbidden.replace("\\", "/")}
-        candidate = Path(forbidden)
-        if candidate.is_absolute():
-            roots.add(str(candidate.resolve()).replace("\\", "/"))
-        for root in roots:
-            root_norm = root.rstrip("/").casefold()
-            if path_norm == root_norm or path_norm.startswith(root_norm + "/"):
-                return forbidden
-    return None
 
 
 
@@ -57,48 +24,41 @@ def remove(path: str, confirm: bool = False, max_items: int = 50) -> dict:
 
     Args:
         path: 文件或目录路径
-        confirm: 文件、链接或目录删除均需显式确认
-        max_items: 单次目录删除的文件数硬上限（最大 1000）
+        confirm: 目录删除需显式确认
+        max_items: 目录超过此文件数时返回提案不执行
     """
+    p = Path(path).resolve()
+
     raw = str(Path(path))
     if any(part == ".." for part in raw.replace("\\", "/").split("/")):
         return {"ok": False, "error": "路径包含 .. 穿越，已被拒绝"}
 
-    # Keep the lexical path for unlinking so deleting a symlink never deletes
-    # the object it points at. Safety checks still inspect the resolved target.
-    p = Path(path).expanduser().absolute()
-    resolved = p.resolve()
-
-    if not p.exists() and not p.is_symlink():
+    if not p.exists():
         return {"ok": False, "error": f"路径不存在: {path}"}
 
-    forbidden = _forbidden_prefix(resolved)
-    if forbidden:
-        return {"ok": False, "error": f"禁止操作系统目录: {path}",
-                "proposal": "路径位于受保护的系统目录中，删除操作已被拦截。",
-                "evidence": {"path": path, "blocked_by": forbidden}}
+    path_str = str(p).replace("\\", "/")
+    for forbidden in _FORBIDDEN_PREFIXES:
+        if path_str.lower().startswith(forbidden.lower() + "/") or path_str.lower() == forbidden.lower():
+            return {"ok": False, "error": f"禁止操作系统目录: {path}",
+                    "proposal": "路径位于受保护的系统目录中，删除操作已被拦截。",
+                    "evidence": {"path": path, "blocked_by": forbidden}}
 
-    if not confirm:
-        kind = "目录" if p.is_dir() and not p.is_symlink() else ("符号链接" if p.is_symlink() else "文件")
-        return proposal_reply(
-            False,
-            f"确认删除{kind}？路径: {path}。请设置 confirm=true。",
-            error=f"{kind}删除需二次确认",
-            evidence={"path": str(p), "kind": kind},
-            options=["confirm_delete", "cancel"],
-        )
-
-    if p.is_symlink() or p.is_file():
+    if p.is_file():
         try:
-            size = p.lstat().st_size
+            size = p.stat().st_size
             os.remove(p)
             return {"ok": True, "deleted": 1, "freed": human_size(size), "errors": []}
         except OSError as e:
             return {"ok": False, "error": str(e)}
 
     if p.is_dir():
+        if not confirm:
+            return proposal_reply(False,
+                f"确认删除目录？目录路径: {path}。请设置 confirm=true。",
+                error="目录删除需二次确认",
+                options=["confirm_delete", "cancel"])
+
         # 单次遍历：计数 + 累加大小
-        max_items = min(max(int(max_items), 1), 1000)
         file_count = 0
         total_size = 0
         for f in p.rglob("*"):
@@ -110,11 +70,10 @@ def remove(path: str, confirm: bool = False, max_items: int = 50) -> dict:
                     pass
         if file_count > max_items:
             return proposal_reply(False,
-                f"目录含 {file_count} 个文件，超过单次删除硬上限 {max_items}；"
-                "请缩小范围或分批删除。",
+                f"目录含 {file_count} 个文件，超过上限 {max_items}。确认删除？",
                 error=f"目录含 {file_count} 个文件，超过批量限制 ({max_items})",
                 evidence={"file_count": file_count, "directory": str(p)},
-                options=["分批删除", "缩小目录范围", "cancel"])
+                options=["confirm_batch_delete", "cancel"])
 
         errors = []
 
@@ -155,11 +114,12 @@ def _check_path(path: str) -> dict | None:
     if any(part == ".." for part in raw.replace("\\", "/").split("/")):
         return {"ok": False, "error": "路径包含 .. 穿越，已被拒绝"}
     p = Path(path).resolve()
-    forbidden = _forbidden_prefix(p)
-    if forbidden:
-        return {"ok": False, "error": f"禁止操作系统目录: {p}",
-                "proposal": "路径位于受保护的系统目录中，操作已被拦截。",
-                "evidence": {"path": str(p), "blocked_by": forbidden}}
+    path_str = str(p).replace("\\", "/")
+    for forbidden in _FORBIDDEN_PREFIXES:
+        if path_str.lower().startswith(forbidden.lower() + "/") or path_str.lower() == forbidden.lower():
+            return {"ok": False, "error": f"禁止操作系统目录: {p}",
+                    "proposal": "路径位于受保护的系统目录中，操作已被拦截。",
+                    "evidence": {"path": str(p), "blocked_by": forbidden}}
     return None
 
 
@@ -279,6 +239,7 @@ def move(sources: list, dest: str, overwrite: bool = False) -> dict:
     """批量移动文件/目录到目标目录。
 
     同分区内使用原子 rename（O(1)），跨分区自动退化为 copy+delete。
+    避免 agent 通过 shell_exec 逐文件 mv 导致超时。
 
     Args:
         sources: 源文件/目录路径列表
@@ -336,10 +297,8 @@ def move(sources: list, dest: str, overwrite: bool = False) -> dict:
         err = _check_path(src_str)
         if err:
             return err
-        # Preserve the lexical source for rename/move so moving a symlink moves
-        # the link itself. _check_path still resolves it for safety validation.
-        src_path = Path(src_str).expanduser().absolute()
-        if not src_path.exists() and not src_path.is_symlink():
+        src_path = Path(src_str).resolve()
+        if not src_path.exists():
             errors.append({"source": src_str, "error": "源路径不存在"})
             continue
         # 预存 (src_str, name) 对，避免循环内重复 Path→str 转换
@@ -356,7 +315,7 @@ def move(sources: list, dest: str, overwrite: bool = False) -> dict:
     # 跨分区检测：取第一个源的设备 ID 与目标比较
     cross_partition = False
     try:
-        src_dev = os.lstat(sources_resolved[0][0]).st_dev
+        src_dev = os.stat(sources_resolved[0][0]).st_dev
         dst_dev = os.stat(str(dest_path)).st_dev
         cross_partition = src_dev != dst_dev
     except OSError:

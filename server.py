@@ -72,6 +72,17 @@ from tools.config_diff import diff as _config_diff
 from tools.proc_list import list_processes as _proc_list
 from tools.sys_snapshot import snapshot as _sys_snapshot
 from tools.disk_info import info as _disk_info
+from tools.git_smart import status as _git_status, diff as _git_diff, log as _git_log, commit as _git_commit, current_branch as _git_branch, remote_url as _git_remote, push as _git_push
+from tools.csv_utils import parse as _csv_parse, generate as _csv_generate
+from tools.semver import compare as _semver_compare
+from tools.md_strip import strip as _md_strip
+from tools.log_parse import parse as _log_parse
+from tools.project_init import scan as _project_init
+from tools.git_changelog import changelog as _git_changelog
+from tools.shell_exec import run as _shell_exec
+from tools.op_log import query as _op_log_query
+from tools.tool_stats import snapshot as _tool_stats_snapshot
+from tools import gh_cli as _gh
 
 mcp = FastMCP(
     "irmia-devkit",
@@ -777,6 +788,125 @@ def uuid_gen(kind: str = "uuid4", length: int = 16) -> str:
         length: hex/token 的长度
     """
     return _json(_uuid_gen(kind=kind, length=length))
+
+
+# ═══════════════════════════════════════════════════════
+# 🆕 最新版工具扩展
+# ═══════════════════════════════════════════════════════
+
+@mcp.tool(annotations=READ_ONLY)
+def git_status(cwd: str = ".") -> str:
+    """查看 Git 仓库状态。"""
+    return _json(_git_status(cwd))
+
+@mcp.tool(annotations=READ_ONLY)
+def git_diff(cwd: str = ".", staged: bool = False, filepath: str = "", max_lines: int = 500) -> str:
+    """查看 Git 差异及统计。"""
+    return _json(_git_diff(cwd, staged=staged, filepath=filepath or None, max_lines=max_lines))
+
+@mcp.tool(annotations=READ_ONLY)
+def git_log(cwd: str = ".", count: int = 5) -> str:
+    """查看最近 Git 提交。"""
+    return _json(_git_log(cwd, count=count))
+
+@mcp.tool(annotations=DESTRUCTIVE)
+def git_commit(cwd: str, message: str, files: list = None, force: bool = False) -> str:
+    """提交 Git 更改。"""
+    return _json(_git_commit(cwd, message, files=files, force=force))
+
+@mcp.tool(annotations=READ_ONLY)
+def git_info(cwd: str = ".", action: str = "branch") -> str:
+    """查询 Git 当前分支或远程地址。"""
+    if action == "branch":
+        result = _git_branch(cwd)
+    elif action == "remote":
+        result = _git_remote(cwd)
+    else:
+        return _json({"ok": False, "error": "action must be branch or remote"})
+    return _json(result)
+
+@mcp.tool(annotations=DESTRUCTIVE_OPEN)
+def git_push(cwd: str = ".", remote: str = "origin", branch: str = "") -> str:
+    """推送 Git 提交。"""
+    return _json(_git_push(cwd, remote=remote, branch=branch))
+
+@mcp.tool(annotations=READ_ONLY)
+def csv_tool(action: str, text: str = "", rows: list = None, delimiter: str = "auto", has_header: bool = True) -> str:
+    """解析或生成 CSV。action=parse 或 generate。"""
+    if action == "parse":
+        return _json(_csv_parse(text, delimiter=delimiter, has_header=has_header))
+    if action == "generate":
+        return _json(_csv_generate(rows or [], delimiter="," if delimiter == "auto" else delimiter))
+    return _json({"ok": False, "error": "action must be parse or generate"})
+
+@mcp.tool(annotations=READ_ONLY)
+def semver_compare(v1: str, v2: str) -> str:
+    """比较两个语义化版本号。"""
+    return _json(_semver_compare(v1, v2))
+
+@mcp.tool(annotations=READ_ONLY)
+def markdown_strip(text: str) -> str:
+    """去除 Markdown 标记并保留纯文本。"""
+    return _json(_md_strip(text))
+
+@mcp.tool(annotations=READ_ONLY)
+def log_parse(text: str, format: str = "auto", max_lines: int = 200) -> str:
+    """解析常见日志并提取结构化事件。"""
+    return _json(_log_parse(text, format=format, max_lines=max_lines))
+
+@mcp.tool(annotations=READ_ONLY)
+def project_init_scan(project_dir: str = ".") -> str:
+    """扫描项目类型、入口和配置。"""
+    return _json(_project_init(project_dir))
+
+@mcp.tool(annotations=READ_ONLY)
+def git_changelog(cwd: str = ".", count: int = 30) -> str:
+    """根据 Git 历史生成变更日志。"""
+    return _json(_git_changelog(cwd, count=count))
+
+@mcp.tool(annotations=DESTRUCTIVE)
+def shell_exec(cmd: str, project_dir: str = ".", timeout: int = 120, max_lines: int = 500, dry_run: bool = False, allow_high_risk: bool = False) -> str:
+    """在项目目录执行经过安全校验的命令。"""
+    return _json(_shell_exec(cmd, project_dir=project_dir, timeout=timeout, max_lines=max_lines, dry_run=dry_run, allow_high_risk=allow_high_risk))
+
+@mcp.tool(annotations=READ_ONLY)
+def operation_log(action: str = "recent", limit: int = 10, file: str = "", tool_name: str = "", session_id: str = "") -> str:
+    """查询 MCP 工具操作日志。"""
+    return _json(_op_log_query(action=action, limit=limit, file=file, tool_name=tool_name, session_id=session_id))
+
+@mcp.tool(annotations=READ_ONLY)
+def tool_stats() -> str:
+    """查看工具调用统计。"""
+    return _json(_tool_stats_snapshot())
+
+@mcp.tool(annotations=DESTRUCTIVE_OPEN)
+def github(action: str, cwd: str = ".", number: int = None, title: str = "", body: str = "", state: str = "open", limit: int = 10, name: str = "", tag: str = "", owner_repo: str = "", run_id: int = None, strategy: str = "squash", private: bool = True) -> str:
+    """GitHub CLI 工作流。action 支持 pr/issue/release/repo/run/auth 的 create、list、view、merge、close、logs、status。"""
+    funcs = {
+        "pr_create": _gh.pr_create, "pr_list": _gh.pr_list, "pr_view": _gh.pr_view, "pr_merge": _gh.pr_merge,
+        "issue_create": _gh.issue_create, "issue_list": _gh.issue_list, "issue_close": _gh.issue_close,
+        "release_create": _gh.release_create, "release_list": _gh.release_list, "repo_view": _gh.repo_view,
+        "repo_create": _gh.repo_create, "run_list": _gh.run_list, "run_view": _gh.run_view,
+        "run_logs": _gh.run_logs, "auth_status": _gh.auth_status,
+    }
+    fn = funcs.get(action)
+    if fn is None:
+        return _json({"ok": False, "error": f"unknown action: {action}", "actions": sorted(funcs)})
+    kwargs = {"cwd": cwd}
+    if action == "auth_status":
+        kwargs = {}
+    elif action in ("pr_create", "issue_create"): kwargs.update(title=title, body=body)
+    elif action in ("pr_list", "issue_list"): kwargs.update(state=state, limit=limit)
+    elif action in ("pr_view", "pr_merge", "issue_close"): kwargs.update(number=number)
+    elif action in ("run_view", "run_logs"): kwargs.update(run_id=run_id)
+    elif action == "release_create": kwargs.update(tag=tag, notes=body)
+    elif action == "release_list" or action == "run_list": kwargs.update(limit=limit)
+    elif action == "repo_view": kwargs.update(owner_repo=owner_repo)
+    elif action == "repo_create": kwargs.update(name=name, private=private)
+    try:
+        return _json(fn(**kwargs))
+    except TypeError:
+        return _json({"ok": False, "error": "参数不完整，请按 action 对应字段调用"})
 
 
 # ═══════════════════════════════════════════════════════
