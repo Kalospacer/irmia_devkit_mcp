@@ -67,6 +67,7 @@ def _run(args: list[str], cwd: Path, timeout: int) -> tuple[int, str, str, float
             args,
             cwd=str(cwd),
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
             errors="replace",
