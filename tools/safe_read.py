@@ -408,51 +408,17 @@ def _read_tail(
 
     返回：(lines, total_lines, start_line, has_more)
     """
-    from collections import deque
-
     p = Path(path)
-    chunk_size = 8192
+    from collections import deque
     buffer = deque(maxlen=n_lines)
-    partial = b""
     total_lines = 0
-
-    with p.open("rb") as f:
-        f.seek(0, os.SEEK_END)
-        size = f.tell()
-        if size == 0:
-            return [], 0, 1, False
-
-        offset = size
-        while offset > 0 and len(buffer) < n_lines:
-            read_size = min(chunk_size, offset)
-            offset -= read_size
-            f.seek(offset)
-            chunk = f.read(read_size)
-            # 按换行分割，保留最后一个不完整的行到 partial
-            lines = chunk.split(b"\n")
-            # 第一个片段与之前累积的不完整行拼接
-            lines[-1] += partial
-            partial = lines.pop(0)
-            # 从后向前收集完整行
-            for line in reversed(lines):
-                if line.endswith(b"\r"):
-                    line = line[:-1]
-                decoded = line.decode(encoding, errors="replace")
-                buffer.appendleft(decoded)
-                if len(buffer) >= n_lines:
-                    break
-            if len(buffer) >= n_lines:
-                break
-
-        # 处理文件开头的不完整行
-        if partial and len(buffer) < n_lines:
-            if partial.endswith(b"\r"):
-                partial = partial[:-1]
-            buffer.appendleft(partial.decode(encoding, errors="replace"))
-
-        # 统计总行数：必须精确——start_line 由 total_lines 推导，
-        # 估算值会导致 tail 显示的行号整体漂移（文件有 10MB 上限，精确统计成本低）
-        total_lines = _count_lines_exact(p, encoding)
+    # Files accepted by safe_read are capped at 10MB.  Iterating decoded
+    # lines keeps newline semantics identical to the range/head readers and
+    # avoids the trailing-newline ghost line produced by reverse byte scans.
+    with p.open("r", encoding=encoding, errors="replace", newline="") as f:
+        for line in f:
+            total_lines += 1
+            buffer.append(line.rstrip("\n").rstrip("\r"))
 
     lines = list(buffer)
     start_line = max(1, total_lines - len(lines) + 1)
@@ -875,6 +841,8 @@ def read(
         content = _format_content(lines, start_line, line_numbers)
         content, byte_truncated_after = _apply_byte_limit(content, detected_encoding)
         byte_truncated = byte_truncated or byte_truncated_after
+        if byte_truncated_after:
+            end_line = start_line + max(0, content.count("\n") + (1 if content else 0)) - 1
 
         has_more = has_more or byte_truncated
         next_call, options = _build_next_call_and_options(str(p), start_line, end_line, total_lines, mode="head")
@@ -915,6 +883,8 @@ def read(
         byte_truncated = byte_truncated or byte_truncated_after
 
         end_line = total_lines
+        if byte_truncated_after:
+            end_line = start_line + max(0, content.count("\n") + (1 if content else 0)) - 1
         has_more = has_more or byte_truncated
         next_call, options = _build_next_call_and_options(str(p), start_line, end_line, total_lines, mode="tail")
         header = _build_header(p, total_lines, file_size, detected_encoding, metadata.get('human_size'))
@@ -959,6 +929,8 @@ def read(
     )
     lines, byte_truncated = _truncate_content_by_bytes(lines, MAX_RETURN_BYTES)
     has_more = has_more or byte_truncated
+    if byte_truncated:
+        actual_end = actual_start + len(lines) - 1
 
     # start_line 超过 EOF 时给出明确错误与导航
     if start_line > 0 and actual_start == 0 and total_lines > 0 and not lines:
@@ -975,6 +947,9 @@ def read(
     content = _format_content(lines, actual_start, line_numbers)
     content, byte_truncated_after = _apply_byte_limit(content, detected_encoding)
     byte_truncated = byte_truncated or byte_truncated_after
+    if byte_truncated_after:
+        displayed_lines = content.count("\n") + (1 if content else 0)
+        actual_end = actual_start + displayed_lines - 1
     has_more = has_more or byte_truncated
 
     truncated = has_more or (file_size > LARGE_FILE_THRESHOLD) or byte_truncated

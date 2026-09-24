@@ -8,6 +8,8 @@ import json
 import re
 import shutil
 import subprocess
+import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -62,21 +64,40 @@ def discover(project_dir: Path) -> tuple[str, list[str]]:
 
 def _run(args: list[str], cwd: Path, timeout: int) -> tuple[int, str, str, float, bool]:
     start = time.monotonic()
+    proc = None
     try:
-        proc = subprocess.run(
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+        proc = subprocess.Popen(
             args,
             cwd=str(cwd),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=min(max(1, int(timeout)), 600),
             shell=False,
+            creationflags=creationflags,
+            start_new_session=(os.name != "nt"),
         )
-        return proc.returncode, proc.stdout or "", proc.stderr or "", time.monotonic() - start, False
+        stdout, stderr = proc.communicate(timeout=min(max(1, int(timeout)), 600))
+        return proc.returncode, stdout or "", stderr or "", time.monotonic() - start, False
     except subprocess.TimeoutExpired as exc:
-        return -1, _to_text(exc.stdout), _to_text(exc.stderr), time.monotonic() - start, True
+        if proc is not None:
+            try:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=5, check=False)
+                else:
+                    os.killpg(proc.pid, signal.SIGKILL)
+            except (OSError, subprocess.SubprocessError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            stdout, stderr = proc.communicate()
+        else:
+            stdout, stderr = exc.stdout, exc.stderr
+        return -1, _to_text(stdout), _to_text(stderr), time.monotonic() - start, True
     except FileNotFoundError as exc:
         return 127, "", str(exc), time.monotonic() - start, False
 
@@ -272,6 +293,19 @@ def run(
         return {"ok": False, "error": f"project_dir does not exist: {root}"}
 
     framework, args = discover(root)
+    selected_file = ""
+    if filepath:
+        candidate = Path(filepath)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        candidate = candidate.resolve()
+        if candidate.is_file():
+            try:
+                selected_file = str(candidate.relative_to(root))
+            except ValueError:
+                return {"ok": False, "error": "filepath 必须位于 project_dir 内"}
+        else:
+            return {"ok": False, "error": f"测试文件不存在: {filepath}"}
     if test_cmd:
         try:
             args = split_command(test_cmd)
@@ -282,6 +316,9 @@ def run(
             return valid
         exe = Path(args[0]).name.lower().removesuffix(".exe")
         framework = {"python": "pytest", "py": "pytest", "pytest": "pytest", "go": "go", "cargo": "cargo", "npx": "jest", "npm": "npm"}.get(exe, framework)
+
+    if selected_file and framework in ("pytest", "jest"):
+        args.append(selected_file)
 
     returncode, stdout, stderr, elapsed, timed_out = _run(args, root, timeout)
     result = _parser_for(framework)(stdout, stderr, returncode, elapsed, timed_out)

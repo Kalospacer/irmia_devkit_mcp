@@ -19,9 +19,29 @@ _PRIVATE_NETS = [
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("192.0.0.0/24"),
+    ipaddress.ip_network("192.0.2.0/24"),
+    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("198.51.100.0/24"),
+    ipaddress.ip_network("203.0.113.0/24"),
     ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("::/128"),
+    ipaddress.ip_network("fe80::/10"),
     ipaddress.ip_network("fc00::/7"),
 ]
+
+
+def _blocked_ip(ip: ipaddress._BaseAddress) -> bool:
+    """Return whether an address is unsuitable as an outbound HTTP target."""
+    if any(ip in net for net in _PRIVATE_NETS):
+        return True
+    # Catch loopback, unspecified, link-local, multicast and reserved ranges
+    # that are not all represented consistently across Python versions.
+    if any(getattr(ip, attr, False) for attr in ("is_loopback", "is_unspecified", "is_link_local", "is_multicast", "is_reserved")):
+        return True
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return bool(mapped and _blocked_ip(mapped))
 
 
 def validate_url(url: str) -> dict | None:
@@ -36,15 +56,8 @@ def validate_url(url: str) -> dict | None:
         return {"ok": False, "error": "URL 缺少有效主机名"}
     try:
         ip = ipaddress.ip_address(hostname)
-        for net in _PRIVATE_NETS:
-            if ip in net:
-                return {"ok": False, "error": f"禁止访问内网地址: {hostname}"}
-        # IPv4-mapped-IPv6: ::ffff:192.168.1.1 → 检查映射的 IPv4
-        ipv4 = ip.ipv4_mapped
-        if ipv4:
-            for net in _PRIVATE_NETS:
-                if ipv4 in net:
-                    return {"ok": False, "error": f"禁止访问内网地址: {hostname}"}
+        if _blocked_ip(ip):
+            return {"ok": False, "error": f"禁止访问内网地址: {hostname}"}
     except (AttributeError, ValueError):
         pass
     try:
@@ -53,12 +66,11 @@ def validate_url(url: str) -> dict | None:
             ip_str = addr[4][0]
             try:
                 ip = ipaddress.ip_address(ip_str)
-                for net in _PRIVATE_NETS:
-                    if ip in net:
-                        return {
-                            "ok": False,
-                            "error": f"禁止访问内网地址: {hostname} 解析到 {ip_str}",
-                        }
+                if _blocked_ip(ip):
+                    return {
+                        "ok": False,
+                        "error": f"禁止访问内网地址: {hostname} 解析到 {ip_str}",
+                    }
             except ValueError:
                 pass
     except socket.gaierror:
@@ -78,7 +90,11 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 def make_opener():
     """创建带 SSRF 重定向校验的 URL opener。"""
-    return urllib.request.build_opener(SafeRedirectHandler())
+    # Ignore HTTP(S)_PROXY/ALL_PROXY from the host environment.  A proxy can
+    # make the validated destination differ from the actual socket target.
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), SafeRedirectHandler()
+    )
 
 
 def check_url(url: str) -> dict | None:

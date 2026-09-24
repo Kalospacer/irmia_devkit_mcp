@@ -8,6 +8,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import signal
 import time
 from pathlib import Path
 
@@ -81,6 +82,24 @@ def _is_dangerous_path_arg(arg: str, cwd: Path) -> str | None:
     仅对看起来像路径的参数做校验（含 /、\\、..、~、盘符开头）。
     返回错误信息或 None。
     """
+    if not arg:
+        return None
+    # Options such as pytest's --basetemp=/outside still carry a filesystem
+    # path even though the argument itself starts with '-'.
+    candidates = [arg]
+    if arg.startswith("-") and "=" in arg:
+        candidates.append(arg.rsplit("=", 1)[1])
+    if arg.startswith("-") and "=" not in arg:
+        return None
+    for candidate in candidates:
+        err = _check_path_candidate(candidate, cwd)
+        if err:
+            return err
+    return None
+
+
+def _check_path_candidate(arg: str, cwd: Path) -> str | None:
+    """Check one value that may be a path, including an option value."""
     if not arg or arg.startswith("-"):
         return None
     lowered = arg.replace("\\", "/").lower()
@@ -189,6 +208,25 @@ def _resolve_executable(args: list[str]) -> list[str]:
     return args
 
 
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Terminate the command and children created by it after a timeout."""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def run(
     cmd: str,
     project_dir: str = ".",
@@ -248,43 +286,57 @@ def run(
     }
     start = time.monotonic()
     try:
-        completed = subprocess.run(
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+        proc = subprocess.Popen(
             _resolve_executable(args),
             cwd=str(cwd),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=min(max(1, int(timeout)), 600),
             shell=False,
             env=env,
+            creationflags=creationflags,
+            start_new_session=(os.name != "nt"),
         )
+        try:
+            stdout_raw, stderr_raw = proc.communicate(timeout=min(max(1, int(timeout)), 600))
+        except subprocess.TimeoutExpired as exc:
+            _kill_process_tree(proc)
+            stdout_raw, stderr_raw = proc.communicate()
+            stdout = _to_text(exc.stdout) or _to_text(stdout_raw)
+            stderr = _to_text(exc.stderr) or _to_text(stderr_raw)
+            stdout, out_truncated = truncate_output(stdout, max_lines)
+            stderr, err_truncated = truncate_output(stderr, max_lines)
+            return {
+                "ok": False,
+                "error": f"command timed out after {timeout}s",
+                "cmd": " ".join(args),
+                "stdout": stdout,
+                "stderr": stderr,
+                "elapsed_s": round(time.monotonic() - start, 3),
+                "truncated": out_truncated or err_truncated,
+            }
+        completed_returncode = proc.returncode
     except FileNotFoundError:
         return {"ok": False, "error": f"command not found: {args[0]}", "cmd": " ".join(args)}
-    except subprocess.TimeoutExpired as exc:
-        stdout, out_truncated = truncate_output(_to_text(exc.stdout), max_lines)
-        stderr, err_truncated = truncate_output(_to_text(exc.stderr), max_lines)
-        return {
-            "ok": False,
-            "error": f"command timed out after {timeout}s",
-            "cmd": " ".join(args),
-            "stdout": stdout,
-            "stderr": stderr,
-            "elapsed_s": round(time.monotonic() - start, 3),
-            "truncated": out_truncated or err_truncated,
-        }
+    except subprocess.TimeoutExpired:
+        # communicate() handles timeout cleanup above; this is only a guard
+        # for unusual platform implementations.
+        return {"ok": False, "error": f"command timed out after {timeout}s", "cmd": " ".join(args)}
 
-    stdout, out_truncated = truncate_output(completed.stdout or "", max_lines)
-    stderr, err_truncated = truncate_output(completed.stderr or "", max_lines)
-    ok = completed.returncode == 0
+    stdout, out_truncated = truncate_output(stdout_raw or "", max_lines)
+    stderr, err_truncated = truncate_output(stderr_raw or "", max_lines)
+    ok = completed_returncode == 0
     return {
         "ok": ok,
         "cmd": " ".join(args),
-        "returncode": completed.returncode,
+        "returncode": completed_returncode,
         "stdout": stdout,
         "stderr": stderr,
         "elapsed_s": round(time.monotonic() - start, 3),
         "truncated": out_truncated or err_truncated,
         "high_risk": bool(valid.get("high_risk")),
-        **({} if ok else {"error": f"command exited with code {completed.returncode}"}),
+        **({} if ok else {"error": f"command exited with code {completed_returncode}"}),
     }

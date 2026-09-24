@@ -10,6 +10,8 @@ import shutil
 from pathlib import Path
 
 from ._helpers import proposal_reply
+from .config import get_config
+from ._vendor import bundled_executable
 
 # 扫描时跳过的目录名
 _SKIP_DIRS = {
@@ -28,11 +30,20 @@ _MAX_TOTAL_SEARCH_STEPS = 500_000
 
 def _has_nested_quantifiers(pattern: str) -> bool:
     """检测常见的灾难性回溯模式 (a+)+、(a*)*、(a?)+ 等。"""
-    return bool(re.search(r'\([^()]*[+\*?][^()]*\)[+\*?]', pattern))
+    return bool(
+        re.search(r'\([^()]*[+\*?][^()]*\)[+\*?]', pattern)
+        or re.search(r'\([^()]*\|[^()]*\)[+\*?]', pattern)
+    )
 
 
 def _find_rg() -> str | None:
-    """查找 rg 可执行文件路径，未找到返回 None。"""
+    """配置路径 → 已校验内置版本 → PATH。"""
+    configured = get_config().get("rg_path", "")
+    if configured and os.path.isfile(configured):
+        return configured
+    bundled = bundled_executable("rg")
+    if bundled:
+        return bundled
     return shutil.which("rg")
 
 

@@ -50,15 +50,22 @@ class TestShellExec:
         assert "exited with code" in result["error"]
 
     def test_timeout_bytes_output_is_decoded(self, monkeypatch):
-        def fake_run(*args, **kwargs):
-            raise subprocess.TimeoutExpired(
-                cmd=args[0],
-                timeout=kwargs["timeout"],
-                output=b"partial stdout",
-                stderr=b"partial stderr",
-            )
+        class FakeProc:
+            pid = 1
+            returncode = -9
+            calls = 0
 
-        monkeypatch.setattr("tools.shell_exec.subprocess.run", fake_run)
+            def communicate(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="pytest", timeout=timeout, output=b"partial stdout", stderr=b"partial stderr")
+                return "partial stdout", "partial stderr"
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr("tools.shell_exec.subprocess.Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr("tools.shell_exec.subprocess.run", lambda *a, **k: None)
 
         result = run("python -m pytest tests", timeout=1)
 
@@ -70,11 +77,24 @@ class TestShellExec:
         """timeout 上限 600 秒，防止误传超大值导致进程悬挂。"""
         captured = {}
 
-        def fake_run(*args, **kwargs):
-            captured["timeout"] = kwargs["timeout"]
-            raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+        class FakeProc:
+            pid = 1
+            returncode = -9
+            calls = 0
 
-        monkeypatch.setattr("tools.shell_exec.subprocess.run", fake_run)
+            def communicate(self, timeout=None):
+                if timeout is not None:
+                    captured["timeout"] = timeout
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="pytest", timeout=timeout)
+                return "", ""
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr("tools.shell_exec.subprocess.Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr("tools.shell_exec.subprocess.run", lambda *a, **k: None)
 
         run("python -m pytest tests", timeout=99999)
 

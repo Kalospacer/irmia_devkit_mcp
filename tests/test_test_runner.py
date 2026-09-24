@@ -38,15 +38,22 @@ class TestTestRunner:
         assert "shell control" in result["error"]
 
     def test_timeout_bytes_output_is_decoded(self, tmp_dir, monkeypatch):
-        def fake_run(*args, **kwargs):
-            raise subprocess.TimeoutExpired(
-                cmd=args[0],
-                timeout=kwargs["timeout"],
-                output=b"1 failed",
-                stderr=b"timeout detail",
-            )
+        class FakeProc:
+            pid = 1
+            returncode = -9
+            calls = 0
 
-        monkeypatch.setattr("tools.test_runner.subprocess.run", fake_run)
+            def communicate(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="pytest", timeout=timeout, output=b"1 failed", stderr=b"timeout detail")
+                return "1 failed", "timeout detail"
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr("tools.test_runner.subprocess.Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr("tools.test_runner.subprocess.run", lambda *a, **k: None)
 
         result = test_runner.run(project_dir=tmp_dir, timeout=1)
 
@@ -58,11 +65,24 @@ class TestTestRunner:
         """timeout 上限 600 秒。"""
         captured = {}
 
-        def fake_run(*args, **kwargs):
-            captured["timeout"] = kwargs["timeout"]
-            raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+        class FakeProc:
+            pid = 1
+            returncode = -9
+            calls = 0
 
-        monkeypatch.setattr("tools.test_runner.subprocess.run", fake_run)
+            def communicate(self, timeout=None):
+                if timeout is not None:
+                    captured["timeout"] = timeout
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="pytest", timeout=timeout)
+                return "", ""
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr("tools.test_runner.subprocess.Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr("tools.test_runner.subprocess.run", lambda *a, **k: None)
 
         test_runner.run(project_dir=tmp_dir, timeout=99999)
 

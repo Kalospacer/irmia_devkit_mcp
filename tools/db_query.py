@@ -4,6 +4,7 @@ db_query — SQLite 只读查询。
 """
 
 import sqlite3
+import re
 from pathlib import Path
 from urllib.parse import quote
 
@@ -22,9 +23,18 @@ def query(db_path: str, sql: str, params: list = None) -> dict:
     if not p.exists():
         return {"ok": False, "error": f"数据库不存在: {db_path}"}
 
-    stripped = sql.strip().upper()
-    if not stripped.startswith("SELECT") and not stripped.startswith("PRAGMA"):
+    stripped = sql.strip()
+    upper = stripped.upper()
+    if not upper.startswith("SELECT") and not upper.startswith("PRAGMA"):
         return {"ok": False, "error": "仅允许 SELECT 和 PRAGMA 语句（只读查询）"}
+    if upper.startswith("PRAGMA"):
+        # A read-only connection still permits connection-changing pragmas
+        # such as journal_mode= or writable_schema=.  Only query-form
+        # pragmas are exposed, and sqlite3.execute must receive one statement.
+        if ";" in stripped or "=" in stripped:
+            return {"ok": False, "error": "仅允许只读 PRAGMA 查询，不允许设置 PRAGMA"}
+        if not re.fullmatch(r"PRAGMA\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*\([^;]*\))?\s*", stripped, re.IGNORECASE):
+            return {"ok": False, "error": "PRAGMA 查询格式非法"}
 
     params = params or []
     try:

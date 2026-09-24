@@ -49,6 +49,10 @@ class TestDbQuery:
         result = query(test_db, "INSERT INTO users VALUES (3, 'Eve')")
         assert result["ok"] is False
 
+    def test_blocks_mutating_pragma(self, test_db):
+        result = query(test_db, "PRAGMA journal_mode=WAL")
+        assert result["ok"] is False
+
     def test_parametrized_prevents_injection(self, test_db):
         result = query(test_db, "SELECT * FROM users WHERE name = ?", ["' OR 1=1--"])
         assert result["ok"] is True

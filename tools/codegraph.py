@@ -389,8 +389,17 @@ class CodeGraph:
         except Exception as exc:
             logger.debug("codegraph suppressed error: %s", exc, exc_info=True)
 
-        if incremental:
-            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('mtimes',?)", (json.dumps(mtimes),))
+        # Full indexes must seed the same mtime map used by incremental
+        # indexes; otherwise the first incremental run cannot remove symbols
+        # belonging to files deleted after a full index.
+        if not incremental:
+            mtimes = {}
+            for fpath in all_files:
+                try:
+                    mtimes[str(fpath.relative_to(root)).replace("\\", "/")] = fpath.stat().st_mtime
+                except OSError:
+                    pass
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('mtimes',?)", (json.dumps(mtimes),))
         conn.commit()
         
         elapsed = round(time.time() - start, 2)
@@ -815,8 +824,8 @@ class CodeGraph:
             ).fetchall()
             for r in rows:
                 name, kind, line, matched_fp = r[0], r[1], r[2], r[3]
-                callers = _bfs_all_callers(conn, name, max_depth)
-                depth_map = {c: i + 1 for i, c in enumerate(callers)}
+                depth_map = _bfs_caller_depths(conn, name, max_depth)
+                callers = list(depth_map)
                 for c in callers:
                     sr = conn.execute("SELECT file,kind,line FROM symbols WHERE name=? LIMIT 1", (c,)).fetchone()
                     if sr:
@@ -1498,8 +1507,13 @@ def _bfs_partial(conn, start: str, end: str, max_depth: int = 8) -> dict | None:
 
 
 def _bfs_all_callers(conn, target: str, max_depth: int = 3) -> list[str]:
+    return list(_bfs_caller_depths(conn, target, max_depth))
+
+
+def _bfs_caller_depths(conn, target: str, max_depth: int = 3) -> dict[str, int]:
+    """Return each caller with its shortest graph distance from target."""
     from collections import deque
-    callers: list[str] = []
+    callers: dict[str, int] = {}
     visited: set[str] = {target}
     q = deque([(target, 0)])
     while q:
@@ -1509,7 +1523,7 @@ def _bfs_all_callers(conn, target: str, max_depth: int = 3) -> list[str]:
         for (caller,) in conn.execute("SELECT from_sym FROM edges WHERE to_sym=? AND kind IN ('calls','extends','triggers','imports')", (node,)):
             if caller not in visited:
                 visited.add(caller)
-                callers.append(caller)
+                callers[caller] = d + 1
                 q.append((caller, d + 1))
     return callers
 

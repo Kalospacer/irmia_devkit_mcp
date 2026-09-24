@@ -1,4 +1,4 @@
-#!/bin/sh
+:;#!/bin/sh
 # 2>NUL & @goto windows
 exec "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/irmia-devkit.sh" "$@"
 exit $?

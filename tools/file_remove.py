@@ -5,6 +5,7 @@ file_remove — 文件/目录删除、移动工具。
 import os
 import shutil
 import subprocess
+import re
 from pathlib import Path
 
 from ._helpers import proposal_reply
@@ -18,6 +19,39 @@ _FORBIDDEN_PREFIXES = [
 ]
 
 
+def _canonical_path_for_safety(path: str | os.PathLike) -> str:
+    """Normalize Windows extended/UNC spellings before blacklist checks."""
+    value = os.fspath(path).replace("\\", "/")
+    lower = value.casefold()
+    if lower.startswith("//?/unc/"):
+        value = "//" + value[8:]
+    elif lower.startswith("//?/") or lower.startswith("//./"):
+        value = value[4:]
+    # Local administrative shares are another spelling of a drive path.
+    match = re.match(r"^//localhost/([a-zA-Z])\$(/.*)?$", value, re.IGNORECASE)
+    if match:
+        value = f"{match.group(1)}:{match.group(2) or '/'}"
+    return value
+
+
+def _protected_root(path: Path) -> str | None:
+    """Return a reason for drive roots and user home, which are never safe deletion targets."""
+    resolved = Path(_canonical_path_for_safety(path)).resolve()
+    try:
+        if resolved == Path.home().resolve():
+            return "用户主目录"
+    except RuntimeError:
+        pass
+    if resolved.parent == resolved:
+        return "文件系统根目录"
+    # Windows drive root may not compare as a POSIX root when tests run under
+    # a compatibility layer.
+    text = str(resolved).replace("\\", "/")
+    if re.fullmatch(r"[A-Za-z]:/?", text):
+        return "盘符根目录"
+    return None
+
+
 
 def remove(path: str, confirm: bool = False, max_items: int = 50) -> dict:
     """删除文件或目录，自带沙箱和批量确认。
@@ -27,23 +61,35 @@ def remove(path: str, confirm: bool = False, max_items: int = 50) -> dict:
         confirm: 目录删除需显式确认
         max_items: 目录超过此文件数时返回提案不执行
     """
-    p = Path(path).resolve()
+    path_err = _check_path(path)
+    if path_err:
+        return path_err
+    p = Path(_canonical_path_for_safety(path)).resolve()
 
-    raw = str(Path(path))
+    raw = _canonical_path_for_safety(path)
     if any(part == ".." for part in raw.replace("\\", "/").split("/")):
         return {"ok": False, "error": "路径包含 .. 穿越，已被拒绝"}
 
     if not p.exists():
         return {"ok": False, "error": f"路径不存在: {path}"}
 
-    path_str = str(p).replace("\\", "/")
+    path_str = _canonical_path_for_safety(p)
     for forbidden in _FORBIDDEN_PREFIXES:
         if path_str.lower().startswith(forbidden.lower() + "/") or path_str.lower() == forbidden.lower():
             return {"ok": False, "error": f"禁止操作系统目录: {path}",
                     "proposal": "路径位于受保护的系统目录中，删除操作已被拦截。",
                     "evidence": {"path": path, "blocked_by": forbidden}}
 
+    protected = _protected_root(p)
+    if protected:
+        return {"ok": False, "error": f"禁止操作{protected}: {path}"}
+
     if p.is_file():
+        if not confirm:
+            return proposal_reply(False,
+                f"确认删除文件？文件路径: {path}。请设置 confirm=true。",
+                error="文件删除需二次确认",
+                options=["confirm_delete", "cancel"])
         try:
             size = p.stat().st_size
             os.remove(p)
@@ -113,13 +159,16 @@ def _check_path(path: str) -> dict | None:
     raw = str(Path(path))
     if any(part == ".." for part in raw.replace("\\", "/").split("/")):
         return {"ok": False, "error": "路径包含 .. 穿越，已被拒绝"}
-    p = Path(path).resolve()
-    path_str = str(p).replace("\\", "/")
+    p = Path(_canonical_path_for_safety(path)).resolve()
+    path_str = _canonical_path_for_safety(p)
     for forbidden in _FORBIDDEN_PREFIXES:
         if path_str.lower().startswith(forbidden.lower() + "/") or path_str.lower() == forbidden.lower():
             return {"ok": False, "error": f"禁止操作系统目录: {p}",
                     "proposal": "路径位于受保护的系统目录中，操作已被拦截。",
                     "evidence": {"path": str(p), "blocked_by": forbidden}}
+    protected = _protected_root(p)
+    if protected:
+        return {"ok": False, "error": f"禁止操作{protected}: {p}"}
     return None
 
 
@@ -326,13 +375,25 @@ def move(sources: list, dest: str, overwrite: bool = False) -> dict:
     dest_contents = set(os.listdir(dest_str)) if os.path.isdir(dest_str) else set()
 
     # overwrite=False 时过滤掉目标已存在的文件（两路径统一检查）
-    if not overwrite and dest_contents:
+    if not overwrite:
         filtered = []
+        planned_names = set()
         for src_str, name in sources_resolved:
-            if name in dest_contents:
+            if name in dest_contents or name in planned_names:
                 errors.append({"source": src_str, "error": f"目标已存在: {dest_str}/{name}"})
             else:
                 filtered.append((src_str, name))
+                planned_names.add(name)
+        sources_resolved = filtered
+    elif overwrite:
+        seen_names = set()
+        filtered = []
+        for src_str, name in sources_resolved:
+            if name in seen_names:
+                errors.append({"source": src_str, "error": f"批量源文件重名: {name}"})
+            else:
+                filtered.append((src_str, name))
+                seen_names.add(name)
         sources_resolved = filtered
 
     if not sources_resolved:

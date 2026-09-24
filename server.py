@@ -243,15 +243,18 @@ def test_runner(project_dir: str = ".", test_cmd: str = "", timeout: int = 120, 
 # ═══════════════════════════════════════════════════════
 
 @mcp.tool(annotations=READ_ONLY_OPEN)
-def http_get(url: str, headers: dict = None, timeout: int = 10) -> str:
+def http_get(url: str, headers: dict = None, timeout: int = 10, format: str = "markdown", extract: bool = False, offset: int = 0) -> str:
     """HTTP GET 请求 (SSRF 四层防护).
 
     Args:
         url: 请求 URL
         headers: 请求头字典
+        format: html / markdown / text
+        extract: 是否提取正文
         timeout: 超时秒数
+        offset: 分页字符偏移量
     """
-    result = _http_get(url, headers=headers, timeout=timeout)
+    result = _http_get(url, headers=headers, format=format, extract=extract, timeout=timeout, offset=offset)
     if not result.get("ok") and isinstance(result.get("status"), int) and result["status"] > 0:
         result.setdefault("proposal", f"HTTP {result['status']}: request failed, check URL or retry")
         result.setdefault("options", ["check URL", "try http_post as alternative", "check network"])
@@ -897,7 +900,8 @@ def github(action: str, cwd: str = ".", number: int = None, title: str = "", bod
         kwargs = {}
     elif action in ("pr_create", "issue_create"): kwargs.update(title=title, body=body)
     elif action in ("pr_list", "issue_list"): kwargs.update(state=state, limit=limit)
-    elif action in ("pr_view", "pr_merge", "issue_close"): kwargs.update(number=number)
+    elif action in ("pr_view", "issue_close"): kwargs.update(number=number)
+    elif action == "pr_merge": kwargs.update(number=number, strategy=strategy)
     elif action in ("run_view", "run_logs"): kwargs.update(run_id=run_id)
     elif action == "release_create": kwargs.update(tag=tag, notes=body)
     elif action == "release_list" or action == "run_list": kwargs.update(limit=limit)

@@ -13,18 +13,34 @@ import shutil
 from pathlib import Path
 from .config import get_config
 from ._helpers import proposal_reply, _run_cmd
+from ._vendor import bundled_executable
 
 
 def _get_es_path() -> str:
-    """获取 es.exe 路径：配置优先 → PATH 自动查找 → 默认路径"""
+    """获取 es.exe 路径：配置优先 → 已校验内置版本 → PATH 自动查找。"""
     config = get_config()
     custom = config.get("es_path", "")
     if custom and os.path.exists(custom):
         return custom
+    bundled = bundled_executable("es")
+    if bundled:
+        return bundled
     found = shutil.which("es")
     if found:
         return found
     return "es"
+
+
+def _find_fd() -> str | None:
+    """查找 fd：配置路径 → 已校验内置版本 → PATH。"""
+    config = get_config()
+    custom = config.get("fd_path", "")
+    if custom and os.path.isfile(custom):
+        return custom
+    bundled = bundled_executable("fd")
+    if bundled:
+        return bundled
+    return shutil.which("fd")
 
 
 SORT_MAP = {
@@ -291,6 +307,18 @@ def search(
     # --- 执行 ---
     proc = _run_cmd(args, timeout=15)
     if not proc["ok"]:
+        # Everything may be installed without its background service running
+        # (notably Error 8: IPC window not found).  The search tool promises a
+        # fallback, so use the local engine instead of exposing a hard failure.
+        fallback = _posix_search(query, path, max_results, case_sensitive, file_type, ext)
+        if fallback.get("ok"):
+            notes = ["Everything 不可用，已回退到本地 Python 搜索"]
+            if not path and os.name == "nt":
+                notes.append(f"未指定 path，Windows 下默认搜索用户主目录: {Path.home()}")
+            if regex or whole_word or sort_by:
+                notes.append("POSIX fallback 不支持 regex/whole_word/sort_by，已按字面量搜索")
+            fallback["note"] = "；".join(notes + [fallback.get("note", "")])
+            return fallback
         err_msg = proc.get("error", "")
         if "超时" in err_msg:
             return proposal_reply(

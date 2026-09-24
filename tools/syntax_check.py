@@ -142,7 +142,7 @@ def _check_nim(p: Path) -> dict:
         }
     except FileNotFoundError:
         return {
-            "ok": False,
+            "ok": True,
             "language": "nim",
             "skipped": True,
             "error": "nim 未安装",
@@ -164,7 +164,7 @@ def _check_go(p: Path) -> dict:
         return {"ok": False, "language": "go", "errors": [{"msg": stderr}]}
     except FileNotFoundError:
         return {
-            "ok": False,
+            "ok": True,
             "language": "go",
             "skipped": True,
             "error": "go 未安装",
@@ -175,7 +175,15 @@ def _check_go(p: Path) -> dict:
 
 
 def _check_node(p: Path) -> dict:
-    """JS/TS 语法检查：node --check。"""
+    """JS syntax check; JSX/TSX require a parser Node does not provide."""
+    if p.suffix.lower() in (".jsx", ".tsx"):
+        return {
+            "ok": True,
+            "language": "jsx/typescript",
+            "skipped": True,
+            "error": f"{p.suffix.lower()} 需要 Babel/TypeScript parser，node --check 不支持",
+            "reason": "跳过 JSX/TSX 语法检查，避免把合法文件误判为语法错误并回滚编辑。",
+        }
     try:
         result = subprocess.run(
             ["node", "--check", "--", str(p)],
@@ -192,7 +200,7 @@ def _check_node(p: Path) -> dict:
         }
     except FileNotFoundError:
         return {
-            "ok": False,
+            "ok": True,
             "language": "javascript/typescript",
             "skipped": True,
             "error": "node 未安装",

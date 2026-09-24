@@ -208,6 +208,22 @@ def push(cwd: str, remote: str = "origin", branch: str = "") -> dict:
             return {"ok": False, "error": f"无法获取当前分支: {b.get('error')}"}
         branch = b["branch"]
 
+    # remote/branch are passed as argv, so shell metacharacters are not the
+    # issue here; option injection is.  In particular, a branch value such as
+    # --receive-pack=... changes the git push command itself.
+    if not isinstance(remote, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", remote):
+        return {"ok": False, "error": f"非法远程名称: {remote!r}"}
+    if not isinstance(branch, str) or not branch or branch.startswith("-"):
+        return {"ok": False, "error": f"非法分支名称: {branch!r}"}
+    if any(ch.isspace() or ord(ch) < 32 for ch in branch) or ".." in branch or "@{" in branch:
+        return {"ok": False, "error": f"非法分支名称: {branch!r}"}
+    if branch.endswith((".", ".lock", "/")) or "//" in branch:
+        return {"ok": False, "error": f"非法分支名称: {branch!r}"}
+
+    ref_check = _run_git(cwd, ["check-ref-format", "--branch", branch])
+    if not ref_check["ok"]:
+        return {"ok": False, "error": f"非法分支名称: {branch!r}"}
+
     # 检查是否有未推送的 commit（预检失败如远程跟踪分支不存在时跳过，由后续 push 自己报错）
     r_check = _run_git(cwd, ["log", f"{remote}/{branch}..HEAD", "--oneline"])
     if r_check["ok"]:

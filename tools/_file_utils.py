@@ -65,7 +65,7 @@ def strip_line_number_prefixes(text: str) -> tuple[str, bool]:
 
 
 # 文本编码探测相关常量
-_PROBE_BYTES = 512  # 文件探针字节数
+_PROBE_BYTES = 512  # 显式 sample_size 时的文件探针字节数
 _TEXT_ENCODINGS = (
     "utf-8-sig",
     "utf-8",
@@ -133,7 +133,12 @@ def detect_encoding(path: str | Path, sample_size: int = _PROBE_BYTES) -> str:
     """
     p = Path(path)
     file_size = p.stat().st_size
-    read_size = min(sample_size, file_size)
+    # A short ASCII prefix is valid under both UTF-8 and GBK.  Probing only
+    # the first 512 bytes therefore silently misclassifies a GBK file whose
+    # first non-ASCII character appears later.  The default path reads the
+    # complete file (safe_edit already enforces a size limit); callers that
+    # explicitly pass sample_size retain bounded probing semantics.
+    read_size = file_size if sample_size == _PROBE_BYTES else min(sample_size, file_size)
     if read_size == 0:
         return "utf-8"
 
@@ -163,7 +168,10 @@ def detect_encoding(path: str | Path, sample_size: int = _PROBE_BYTES) -> str:
                 return enc
         except UnicodeDecodeError as exc:
             # 4) 末尾截断重试：变长编码样本末尾可能切到多字节中间
-            if exc.start >= len(raw) - 4 and exc.start > 0:
+            # Only a bounded sample can end halfway through a multibyte
+            # character.  On a full-file probe, trimming the final bytes
+            # would incorrectly turn a GBK suffix into an apparent UTF-8 file.
+            if read_size < file_size and exc.start >= len(raw) - 4 and exc.start > 0:
                 for trim in range(1, min(4, len(raw)) + 1):
                     try:
                         decoded = raw[:-trim].decode(enc)
@@ -230,7 +238,9 @@ def _check_path_safety(path: str | Path, *, read: bool = True) -> dict | None:
     if ".." in raw.split("/"):
         return {"ok": False, "error": "路径包含 .. 穿越，已被拒绝"}
 
-    p = Path(path).resolve()
+    from .file_remove import _canonical_path_for_safety
+
+    p = Path(_canonical_path_for_safety(path)).resolve()
     path_str = str(p).replace("\\", "/")
     from .file_remove import _FORBIDDEN_PREFIXES
 

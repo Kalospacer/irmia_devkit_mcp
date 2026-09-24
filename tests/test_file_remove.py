@@ -17,7 +17,7 @@ class TestFileRemove:
     def test_remove_file(self, tmp_path):
         f = tmp_path / "a.txt"
         f.write_text("x", encoding="utf-8")
-        r = remove(str(f))
+        r = remove(str(f), confirm=True)
         assert r["ok"] is True
         assert r["deleted"] == 1
         assert not f.exists()
