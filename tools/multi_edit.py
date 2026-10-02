@@ -13,10 +13,9 @@ from pathlib import Path
 from ._file_utils import SAFE_EDIT_MAX_SIZE, read_file_with_encoding, find_closest_line, align_whitespace, backup_name_stem, check_path_allowed, prune_backups, strip_line_number_prefixes
 from ._file_utils import _atomic_target_mode
 from .safe_edit import _backup_dir
-from .syntax_check import check as syntax_check_file
+from .syntax_check import check as syntax_check_file, supports as supports_syntax
 
 
-_CODE_SUFFIXES = (".py", ".nim", ".go", ".js", ".ts", ".jsx", ".tsx")
 
 
 class AmbiguousMatchError(ValueError):
@@ -114,7 +113,7 @@ def _apply_one(content: str, edit_item: dict, item_index: int) -> tuple[str, dic
 
 
 def _syntax_check_temp(original: Path, content: str, encoding: str) -> dict:
-    if original.suffix.lower() not in _CODE_SUFFIXES:
+    if not supports_syntax(original):
         return {"ok": True, "language": "text", "skipped": True}
     fd = -1
     tmp_name = ""
@@ -244,10 +243,12 @@ def run(edits: list, syntax_check: bool = True) -> dict:
             "rolled_back_all": True,
         }
 
+    syntax_checks = {}
     if syntax_check:
         for path, data in files.items():
             result = _syntax_check_temp(path, data["content"], data["encoding"])
-            if not result.get("ok"):
+            syntax_checks[str(path)] = result
+            if not result.get("ok") and not result.get("skipped"):
                 return {
                     "ok": False,
                     "error": f"{path}: syntax check failed",
@@ -307,6 +308,8 @@ def run(edits: list, syntax_check: bool = True) -> dict:
         "total_applied": len(edits),
         "replacements_made": replacements_made,
         "rolled_back_all": False,
+        "syntax_checks": syntax_checks,
+        "syntax_ok": (None if not syntax_check or any(result.get("skipped") for result in syntax_checks.values()) else True),
         "backups": {str(path): str(backup) for path, backup in backups.items()},
         "plan": plan,
     }

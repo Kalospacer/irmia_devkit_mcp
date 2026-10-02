@@ -67,11 +67,12 @@ class TestSafeEdit:
         assert result["rolled_back"] is True
         assert Path(python_file).read_text() == original
 
-    def test_backup_dir_config(self):
-        """Verify backup_dir defaults to ~/.irmia/backups."""
-        d = _backup_dir()
-        assert d.name == "backups"
-        assert ".irmia" in str(d)
+    def test_backup_dir_config(self, tmp_path, monkeypatch):
+        """默认备份目录位于家目录，测试使用隔离的临时家目录。"""
+        from tools import config
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        config.set_config({})
+        assert _backup_dir() == tmp_path / ".irmia" / "backups"
 
     def test_occurrence_exceeds_count(self, python_file):
         Path(python_file).write_text("a b c\n")

@@ -15,9 +15,9 @@ from tools.tool_stats import reset as _reset_stats_fn
 
 
 @pytest.fixture(autouse=True)
-def _reset_config():
-    """每个测试前重置全局配置，防止测试间互扰。"""
-    _tool_config.set_config({}, plugin_dir="")
+def _reset_config(tmp_path):
+    """隔离测试配置和备份，不写入用户真实家目录。"""
+    _tool_config.set_config({"backup_dir": str(tmp_path / "backups")}, plugin_dir="")
 
 
 @pytest.fixture(autouse=True)

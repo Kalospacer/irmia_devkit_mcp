@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .config import get_config, get_plugin_dir
 from .file_patch import patch
-from .syntax_check import check as syntax_check
+from .syntax_check import check as syntax_check, supports as supports_syntax
 from ._file_utils import (
     read_file_with_encoding,
     find_closest_line,
@@ -357,12 +357,11 @@ def edit(
         result["replaced"] = patch_result.get("replaced", 0)
 
     # 3. 语法检查（只对代码文件）
-    suffix = p.suffix.lower()
-    if suffix in (".py", ".nim", ".go", ".js", ".ts", ".jsx", ".tsx"):
+    if supports_syntax(p):
         check_result = syntax_check(filepath)
         result["syntax_check"] = check_result
 
-        if not check_result.get("ok"):
+        if check_result.get("skipped") or not check_result.get("ok"):
             if check_result.get("skipped"):
                 result["syntax_ok"] = None
                 result["syntax_check"] = check_result

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "irmia-devkit-mcp"
-version = "2.7.2"
+version = "2.7.3"
 description = "Irmia DevKit MCP Server — 为 Vibe Coding 工具提供安全代码开发工具集"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -17,6 +17,8 @@ dependencies = [
     "lxml==6.1.1",
     "PyYAML==6.0.3",
     "psutil==7.2.2",
+    "chardet>=5.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.scripts]
@@ -28,7 +30,7 @@ Repository = "https://github.com/irmia2026/irmia_devkit_mcp"
 Issues = "https://github.com/irmia2026/irmia_devkit_mcp/issues"
 
 [tool.setuptools]
-py-modules = ["__main__", "server"]
+py-modules = ["__main__", "server", "mcp_results"]
 
 [tool.setuptools.packages.find]
 include = ["tools", "tools.*"]
@@ -40,3 +42,6 @@ ignore = ["E701", "E741"]
 testpaths = ["tests"]
 addopts = "--ignore=tests/test_devkit_web.py --ignore=tests/test_group_default_config.py"
 markers = ["slow: performance-sensitive tests"]
+
+[tool.setuptools.package-data]
+tools = ["*.java"]

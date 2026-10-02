@@ -7,3 +7,10 @@ metadata.yaml text eol=lf
 vendor/rg -text
 vendor/fd -text
 vendor/*.exe -text
+
+*.toml text eol=lf
+*.txt text eol=lf
+*.js text eol=lf
+
+.gitattributes text eol=lf
+*.java text eol=lf

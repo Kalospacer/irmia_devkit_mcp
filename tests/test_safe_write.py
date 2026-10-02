@@ -102,14 +102,15 @@ class TestSafeWrite:
         assert result["rolled_back"] is True
         assert fp.read_text() == "x = 1\n"  # 已回滚
 
-    def test_overwrite_non_code_skips_syntax(self, tmp_dir):
-        """overwrite=True 非代码文件跳过语法检查"""
+    def test_overwrite_yaml_checks_syntax(self, tmp_dir):
+        """overwrite=True 时 YAML 使用统一语法检查路由。"""
         _cfg.set_config({"backup_dir": str(Path(tmp_dir) / "backups")})
         fp = Path(tmp_dir) / "config.yaml"
         fp.write_text("key: old\n")
         result = write(str(fp), "key: new\n", overwrite=True)
         assert result["ok"] is True
-        assert result.get("syntax_ok") is None  # 非代码文件
+        assert result.get("syntax_ok") is True
+        assert result["syntax_check"]["language"] == "yaml"
         assert fp.read_text() == "key: new\n"
 
     def test_content_too_large(self, tmp_dir):

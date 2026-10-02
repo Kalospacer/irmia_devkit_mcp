@@ -45,6 +45,7 @@ from tools.http_get import get as _http_get, post as _http_post
 from tools.http_download import download as _http_download
 from tools.rg_search import search as _rg_search
 from tools.codegraph import CodeGraph
+from mcp_results import adapt_result
 from tools.symbol_rename import run as _symbol_rename
 from tools.dep_scan import scan as _dep_scan
 from tools.db_query import query as _db_query
@@ -89,7 +90,7 @@ mcp = FastMCP(
     instructions="弥亚开发工具箱 MCP — 安全代码编辑、搜索、测试、代码智能、网络、文件、编码、时间、文本处理、系统信息。为仅有 shell 的 bare agent 提供全面且安全的开发工具集。",
 )
 # FastMCP 1.27 does not expose its underlying Server version parameter.
-mcp._mcp_server.version = "2.7.2"
+mcp._mcp_server.version = "2.7.3"
 
 # These hints are part of the public MCP schema. Hosts can use them to keep
 # inspection available in read-only modes and gate mutations appropriately.
@@ -101,7 +102,7 @@ DESTRUCTIVE_OPEN = ToolAnnotations(readOnlyHint=False, destructiveHint=True, ide
 
 
 def _json(result: dict) -> str:
-    return json.dumps(result, ensure_ascii=False)
+    return json.dumps(adapt_result(result), ensure_ascii=False)
 
 
 
@@ -111,22 +112,20 @@ def _json(result: dict) -> str:
 # ═══════════════════════════════════════════════════════
 
 @mcp.tool(annotations=DESTRUCTIVE)
-def safe_edit(filepath: str, old: str, new: str, replace_all: bool = False, occurrence: int = 0) -> str:
-    """安全编辑文件：自动备份→替换→语法检查→通过保留/失败回滚。
-    修改任何代码文件必须使用此工具，内置 whitespace 容错对齐。多处匹配时返回所有位置供消歧。
+def safe_edit(filepath: str, old: str = "", new: str = "", replace_all: bool = False, occurrence: int = 0,
+              align_whitespace: bool = True, mode: str = "replace", line: int = 0,
+              start_line: int = 0, end_line: int = 0) -> str:
+    """安全编辑：备份、替换或行号编辑、语法校验，失败恢复原文件。
 
-    Args:
-        filepath: 文件路径
-        old: 旧文本（精确匹配，允许缩进容错）
-        new: 新文本
-        replace_all: 是否替换所有匹配
-        occurrence: 替换第 N 次出现（多匹配消歧用，0=首次）
+    replace 模式 old 必填，new 可为空；insert_at_line 在 line 行后插入（0=开头）；
+    delete_lines 删除 start_line~end_line 闭区间。缺工具链时 syntax_ok=null。
     """
-    result = _safe_edit(filepath, old, new, replace_all=replace_all, occurrence=occurrence)
-    if result.get("ok") and result.get("syntax_ok") is not False and filepath.endswith((".py", ".go", ".rs", ".js", ".ts")):
+    result = _safe_edit(filepath, old, new, replace_all=replace_all, occurrence=occurrence,
+                        align_whitespace=align_whitespace, mode=mode, line=line,
+                        start_line=start_line, end_line=end_line)
+    if result.get("ok") and result.get("syntax_ok") is not False and Path(filepath).suffix.lower() in (".py", ".go", ".rs", ".js", ".ts", ".jsx", ".tsx", ".java", ".c", ".h", ".cpp", ".hpp"):
         _auto_index(filepath)
     return _json(result)
-
 
 @mcp.tool(annotations=READ_ONLY)
 def safe_backups(filepath: str = "") -> str:
@@ -166,33 +165,21 @@ def safe_write(filepath: str, content: str, overwrite: bool = False) -> str:
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
-def file_patch(filepath: str, old: str, new: str, replace_all: bool = False) -> str:
-    """精确文本替换（非代码文件用）。自带 whitespace 对齐容错。
-
-    Args:
-        filepath: 文件路径
-        old: 旧文本
-        new: 新文本
-        replace_all: 是否替换所有匹配
-    """
-    return _json(_file_patch(filepath, old, new, replace_all=replace_all))
-
+def file_patch(filepath: str, old: str, new: str, replace_all: bool = False,
+                 occurrence: int = 0, preserve_inner_indent: bool = True) -> str:
+    """精确替换非代码文本，支持发生次数消歧与缩进保留。"""
+    return _json(_file_patch(filepath, old, new, replace_all=replace_all,
+                       occurrence=occurrence, preserve_inner_indent=preserve_inner_indent))
 
 @mcp.tool(annotations=READ_ONLY)
-def file_preview(filepath: str, old: str, new: str, replace_all: bool = False) -> str:
-    """预览 file_patch 的替换效果（dry-run diff），不实际修改文件。
-
-    Args:
-        filepath: 文件路径
-        old: 旧文本
-        new: 新文本
-        replace_all: 是否替换所有匹配
-    """
-    return _json(_file_preview(filepath, old, new, replace_all=replace_all))
-
+def file_preview(filepath: str, old: str, new: str, replace_all: bool = False,
+                 occurrence: int = 0, preserve_inner_indent: bool = True) -> str:
+    """只预览精确替换的 diff，不写入文件。"""
+    return _json(_file_preview(filepath, old, new, replace_all=replace_all,
+                       occurrence=occurrence, preserve_inner_indent=preserve_inner_indent))
 
 @mcp.tool(annotations=DESTRUCTIVE)
-def multi_edit(edits: list, syntax_check: bool = True) -> str:
+def multi_edit(edits: list[dict], syntax_check: bool = True) -> str:
     """跨文件原子编辑：所有编辑在内存中完成，全成功才一次写入磁盘。任一文件写入失败 → 全量回滚所有文件。
 
     Args:
@@ -204,7 +191,7 @@ def multi_edit(edits: list, syntax_check: bool = True) -> str:
 
 @mcp.tool(annotations=READ_ONLY)
 def syntax_check(filepath: str) -> str:
-    """检查文件语法。支持 Python / Go / Nim / JavaScript / TypeScript。
+    """检查 Python/Nim/Go/JS/TS/Rust/Java/C/C++/PHP/PowerShell/Shell/JSON/TOML/YAML。缺少检查器返回 skipped；JSX/TSX 未安装解析器时跳过。
 
     Args:
         filepath: 文件路径
@@ -264,17 +251,17 @@ def http_get(url: str, headers: dict = None, timeout: int = 10, format: str = "m
 
 
 @mcp.tool(annotations=DESTRUCTIVE_OPEN)
-def http_post(url: str, data: str = "", headers: dict = None, timeout: int = 10) -> str:
+def http_post(url: str, data: dict | str = "", headers: dict = None, timeout: int = 10) -> str:
     """HTTP POST 请求 (SSRF 防护). 多数 MCP 客户端只能 GET.
 
     Args:
         url: 请求 URL
-        data: 请求体 JSON 字符串
+        data: JSON 对象或原始字符串；合法 JSON 字符串兼容自动解析
         headers: 请求头字典
         timeout: 超时秒数
     """
-    parsed = None
-    if data:
+    parsed = data if isinstance(data, dict) else None
+    if isinstance(data, str) and data:
         try:
             parsed = json.loads(data)
         except Exception:
@@ -290,11 +277,11 @@ def http_post(url: str, data: str = "", headers: dict = None, timeout: int = 10)
 
 @mcp.tool(annotations=DESTRUCTIVE_OPEN)
 def http_download(url: str, path: str, overwrite: bool = False, timeout: int = 60) -> str:
-    """下载文件到指定路径 (SSRF + 路径沙箱 + 500MB上限).
+    """下载到 ~/.irmia/downloads/，path 仅使用文件名 (SSRF + 500MB上限).
 
     Args:
         url: 下载 URL
-        path: 保存路径
+        path: 文件名（输入路径只取最后的文件名，不指定任意保存目录）
         overwrite: 是否覆盖已存在文件
         timeout: 超时秒数
     """
@@ -323,7 +310,8 @@ def safe_read(
     mode: str = "auto",
     head: int = 0,
     tail: int = 0,
-    include_metadata: bool = True,
+    include_metadata: bool = False,
+    line_numbers: bool = True,
 ) -> str:
     """增强版安全文件读取：编码自动检测、二进制/hex、head/tail、行号范围、代码骨架。
     替代旧版 file_read，编辑前必调。
@@ -339,10 +327,11 @@ def safe_read(
         mode: 模式：auto / text / binary / hex / skeleton
         head: 读取前 N 行（优先级高于 start_line/end_line）
         tail: 读取后 N 行（优先级高于 start_line/end_line）
-        include_metadata: 是否包含文件元信息
+        include_metadata: 是否包含文件元信息，默认关闭
+        line_numbers: 是否添加行号前缀，默认开启
     """
     kwargs = {"path": path, "start_line": start_line, "end_line": end_line, "encoding": encoding,
-              "mode": mode, "head": head, "tail": tail, "include_metadata": include_metadata}
+              "mode": mode, "head": head, "tail": tail, "include_metadata": include_metadata, "line_numbers": line_numbers}
     if max_lines > 0:
         kwargs["max_lines"] = max_lines
     if offset > 0:
@@ -440,17 +429,20 @@ def file_hash(filepath: str, algo: str = "sha256") -> str:
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
-def file_zip(source: str, output: str = "") -> str:
-    """ZIP 压缩。压缩目录或文件到 output zip。
+def file_zip(source: str = "", output: str = "", files_or_dir: list[str] | None = None) -> str:
+    """ZIP 压缩。source 为兼容单来源入口，files_or_dir 支持多个来源，二者不能同时使用。
 
-    Args:
-        source: 要压缩的文件或目录路径
-        output: 输出 zip 路径，空则使用 source + ".zip"
+    多来源必须指定 output；单来源未指定 output 时使用来源路径 + .zip。
     """
-    if not output:
-        output = f"{source}.zip"
-    return _json(_file_zip(files_or_dir=[source], output=output))
-
+    if source and files_or_dir is not None:
+        return _json({"ok": False, "error": "source 与 files_or_dir 不能同时使用"})
+    sources = files_or_dir if files_or_dir is not None else ([source] if source else [])
+    if not sources or any(not value for value in sources):
+        return _json({"ok": False, "error": "至少提供一个有效来源"})
+    if not output and len(sources) != 1:
+        return _json({"ok": False, "error": "多个来源必须指定 output"})
+    output = output or f"{sources[0]}.zip"
+    return _json(_file_zip(files_or_dir=sources, output=output))
 
 @mcp.tool(annotations=DESTRUCTIVE)
 def file_unzip(zip_file: str, output_dir: str = "") -> str:
@@ -760,7 +752,7 @@ def time(action: str = "now", value: str = "", ts: int = 0, ms: bool = False, is
 # ═══════════════════════════════════════════════════════
 
 @mcp.tool(annotations=READ_ONLY)
-def db_query(db_path: str, sql: str, params: list = None) -> str:
+def db_query(db_path: str, sql: str, params: list[str | int | float | None] | None = None) -> str:
     """只读 SQLite 查询（仅允许 SELECT/PRAGMA，参数化查询防注入）。
 
     Args:

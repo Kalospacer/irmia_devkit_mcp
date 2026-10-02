@@ -5,7 +5,7 @@ description: >
   核心原则：先确认后执行、自动备份回滚、语法门禁。
   可用工具：safe_edit、safe_read、multi_edit、safe_rollback、safe_backups、file_patch、
   git_*、syntax_check、lint_runner、test_runner、file_diff、es_search、rg_search、
-  dir_tree、dir_list、gh_pr、gh_issue、dep_scan、code_*、symbol_rename。
+  dir_tree、dir_list、github、dep_scan、code_*、symbol_rename。
 ---
 
 # 开发工作流
@@ -22,7 +22,7 @@ description: >
 ## 改代码之前
 
 1. `git_status` — 确认工作区干净，无意外修改
-2. `git_branch` — 确认在正确的分支上
+2. `git_info(action="branch")` — 确认在正确的分支上
 3. `safe_backups` — 看一眼有没有旧备份可用
 4. `safe_read` — 改前先读文件确认当前内容（支持自动编码检测、head/tail/行范围/hex）
 5. 文件搜索：`es_search`（按文件名/扩展名/大小）→ `rg_search`（按代码内容）→ `dir_tree`（按目录层级浏览）
@@ -33,7 +33,7 @@ description: >
 - **需求模糊** → 先 brainstorming 探索方案，确认后再动
 - **需求清晰但复杂** → 先 writing-plans 拆任务，确认后再执行
 - **简单修改** → 直接 safe_edit
-- **审完** → 问是否修 Critical/High，修完自动 commit push
+- **审完** → 问是否修 Critical/High，修完先汇报，仅在用户明确授权后提交或推送
 
 不需要路由表，不需要流水线引擎。用判断力。
 
@@ -52,8 +52,8 @@ description: >
 
 - commit message 按 `fix:` / `feat:` / `refactor:` 规范
 - `git diff --cached` 自查无敏感内容
-- 大改动前备份到安全目录（如插件的 backups/ 目录）
-- 推送后如需创建 PR → 用 `gh_pr`
+- 大改动前将整个项目备份到项目外的安全目录；工具自动文件备份不等于全量项目备份
+- 推送后如需创建 PR → 用 `github(action="pr_create")`
 
 ## 代码智能工具组
 
@@ -98,3 +98,8 @@ code_index（一次性建索引）
 - ❌ 用 code_pack 查单个符号定义（用 explore 更快）
 - ❌ 用 explore 查改动影响（用 diff_impact，它从文件反推符号树）
 - ❌ 改 5 个文件但 diff_impact 只查 1 个（传列表一次查全）
+
+
+## 检查结果与参数
+
+syntax_ok=true 表示实际检查通过，false 表示语法失败，null/skipped 表示未检查。JSON/TOML/YAML 与代码文件使用同一检查链；JSX/TSX 缺解析器时不能声称语法通过。safe_edit 的 replace 模式允许 new="" 删除内容；行号模式支持省略 old/new。目录输入不提供递归读取；代码结果中的相对 file 路径应结合 project_dir，再交给 safe_read。

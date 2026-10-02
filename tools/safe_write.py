@@ -23,14 +23,13 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from .syntax_check import check as syntax_check
+from .syntax_check import check as syntax_check, supports as supports_syntax
 from ._file_utils import read_file_with_encoding, human_size, SAFE_EDIT_MAX_SIZE, atomic_write_text, _first_existing_parent, backup_name_stem, prune_backups
 from .safe_edit import _backup_dir
 from .file_remove import _FORBIDDEN_PREFIXES
 
 
 _PREVIEW_LINES = 8
-_CODE_SUFFIXES = (".py", ".nim", ".go", ".js", ".ts", ".jsx", ".tsx")
 
 
 def _preview(content: str, n: int = _PREVIEW_LINES) -> dict:
@@ -64,7 +63,7 @@ def _check_forbidden(p: Path, raw: str) -> dict | None:
 
 def _run_syntax_check(p: Path) -> dict | None:
     """对代码后缀文件运行语法检查；非代码文件返回 None。"""
-    if p.suffix.lower() not in _CODE_SUFFIXES:
+    if not supports_syntax(p):
         return None
     return syntax_check(str(p))
 
@@ -205,7 +204,7 @@ def write(filepath: str, content: str, overwrite: bool = False) -> dict:
         if check_result is None:
             result["syntax_ok"] = None
             result["syntax_check"] = {"note": "非代码文件，跳过语法检查"}
-        elif check_result.get("ok"):
+        elif check_result.get("ok") and not check_result.get("skipped"):
             result["syntax_ok"] = True
             result["syntax_check"] = check_result
         elif check_result.get("skipped"):
@@ -284,7 +283,7 @@ def write(filepath: str, content: str, overwrite: bool = False) -> dict:
     if check_result is None:
         result["syntax_ok"] = None
         result["syntax_check"] = {"note": "非代码文件，跳过语法检查"}
-    elif check_result.get("ok"):
+    elif check_result.get("ok") and not check_result.get("skipped"):
         result["syntax_ok"] = True
         result["syntax_check"] = check_result
     elif check_result.get("skipped"):

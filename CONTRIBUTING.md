@@ -116,7 +116,7 @@ The standard library is the default. Before adding a third-party dependency:
 - [ ] `python server.py --http` — starts Streamable HTTP on 127.0.0.1
 - [ ] Tool count in README table matches `@mcp.tool()` registrations in `server.py`
 - [ ] Version bumped consistently in `pyproject.toml`, `package.json`, and `reasonix-plugin.json`
-- [ ] Real MCP handshake returns 44 tools with explicit safety annotations
+- [ ] Real MCP handshake returns 60 tools with explicit safety annotations
 - [ ] npm and wheel contents contain no undeclared executable or cache artifact
 - [ ] `CHANGELOG.md` — `[Unreleased]` section renamed to the new version, fresh `[Unreleased]` added
 - [ ] `python -m pip wheel --no-deps -w dist .` — wheel builds cleanly

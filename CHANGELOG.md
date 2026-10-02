@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.7.3 — 上游检查链与 MCP 公开接口对齐
+
+- 多语言语法检查统一接入安全编辑、覆盖与批量编辑；跳过不报假通过。
+- Java 使用 JDK 纯解析接口，避免临时文件名及缺依赖误报；Python 不生成 pyc。
+- 公开行号编辑、补丁消歧、读取行号开关、多来源压缩和对象 POST；修正 file_diff 后续调用参数。
+- 保留 MCP fork 安全修复，更新真实 60 工具文档、测试隔离与分发资产。
+
+
 ## v2.6.5 — http_get 健壮性：编码嗅探 / 指数退避重试 / 二进制分流 / final_url
 
 - **http_get 编码嗅探**: 响应体解码从硬编码 UTF-8 改为三级嗅探（Content-Type charset → charset_normalizer → chardet，均为可选降级，兜底 UTF-8），修复 GBK/GB18030 中文站点静默乱码（`errors="replace"` 产生的 `` 属于"成功但内容全毁"的静默错误）。

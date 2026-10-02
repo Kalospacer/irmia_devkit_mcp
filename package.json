@@ -1,13 +1,14 @@
 {
   "name": "irmia-devkit-mcp",
-  "version": "2.7.2",
-  "description": "弥亚开发工具箱 MCP — 44 个带权限注解的本地开发工具",
+  "version": "2.7.3",
+  "description": "弥亚开发工具箱 MCP — 60 个带权限注解的本地开发工具",
   "bin": {
     "irmia-devkit": "./bin/irmia-devkit.js",
     "irmia-devkit-mcp": "./bin/irmia-devkit.js"
   },
   "files": [
     "server.py",
+    "mcp_results.py",
     "tools/",
     "bin/",
     "skills/",
@@ -18,7 +19,11 @@
     "__main__.py",
     "README.md",
     "README.zh-CN.md",
-    "LICENSE"
+    "LICENSE",
+    "ARCHITECTURE.md",
+    "UPSTREAM_ALIGNMENT.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md"
   ],
   "scripts": {
     "start": "node ./bin/irmia-devkit.js --http --port 8000",
